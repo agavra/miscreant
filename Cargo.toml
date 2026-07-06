@@ -8,6 +8,8 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+gix-hash = { version = "0.25.1", features = ["sha1", "sha256"] }
+gix-object = { version = "0.62.0", features = ["sha1", "sha256"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"

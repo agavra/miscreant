@@ -1,4 +1,5 @@
 pub mod config;
+pub mod storage;
 
 use std::sync::Arc;
 
