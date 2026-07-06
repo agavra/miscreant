@@ -1,17 +1,18 @@
 //! Storage key encoding and decoding.
 //!
 //! Every key in every segment begins with the same fixed-width preamble
-//! (`version | repo_id | segment`) followed by a segment-specific suffix. See
-//! `docs/0001-init.md` §Storage (Key Preamble and the per-segment Key Layout
-//! subsections) for the exact layout.
+//! (`segment | version | repo_id`) followed by a segment-specific suffix.
+//! The segment byte leads so each segment is a single key prefix shared by
+//! all repositories. See `docs/0001-init.md` §Storage (Key Preamble and the
+//! per-segment Key Layout subsections) for the exact layout.
 
 use gix_hash::ObjectId;
 
 /// The current key format version.
 pub const KEY_VERSION: u8 = 1;
 
-/// Length in bytes of the fixed `version | repo_id | segment` preamble.
-const PREAMBLE_LEN: usize = 1 + 8 + 1;
+/// Length in bytes of the fixed `segment | version | repo_id` preamble.
+const PREAMBLE_LEN: usize = 1 + 1 + 8;
 
 /// Opaque, fixed-width repository id assigned at repo creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -100,9 +101,9 @@ pub enum KeyError {
 }
 
 fn encode_preamble(buf: &mut Vec<u8>, repo: RepoId, segment: Segment) {
+    buf.push(segment.as_u8());
     buf.push(KEY_VERSION);
     buf.extend_from_slice(&repo.0.to_be_bytes());
-    buf.push(segment.as_u8());
 }
 
 /// Split a key into its preamble fields and segment-specific suffix.
@@ -113,14 +114,14 @@ fn decode_preamble(bytes: &[u8]) -> Result<(RepoId, Segment, &[u8]), KeyError> {
             actual: bytes.len(),
         });
     }
-    let version = bytes[0];
+    let version = bytes[1];
     if version != KEY_VERSION {
         return Err(KeyError::UnsupportedVersion(version));
     }
+    let segment = Segment::try_from(bytes[0])?;
     let repo_id = u64::from_be_bytes([
-        bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+        bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
     ]);
-    let segment = Segment::try_from(bytes[9])?;
     Ok((RepoId(repo_id), segment, &bytes[PREAMBLE_LEN..]))
 }
 
@@ -258,9 +259,8 @@ mod tests {
     #[test]
     fn meta_key_golden_bytes() {
         let key = meta_key(RepoId(0), "repo:acme/widgets");
-        let mut expected = vec![0x01u8]; // version
+        let mut expected = vec![0x00u8, 0x01]; // segment = meta, version
         expected.extend_from_slice(&0u64.to_be_bytes()); // repo_id = 0 (global)
-        expected.push(0x00); // segment = meta
         expected.extend_from_slice(b"repo:acme/widgets");
         assert_eq!(key, expected);
     }
@@ -277,9 +277,8 @@ mod tests {
     fn object_key_golden_bytes_sha1() {
         let oid = sha1_oid();
         let key = object_key(RepoId(42), &oid);
-        let mut expected = vec![0x01u8];
+        let mut expected = vec![0x01u8, 0x01]; // segment = object, version
         expected.extend_from_slice(&42u64.to_be_bytes());
-        expected.push(0x01); // segment = object
         expected.extend_from_slice(oid.as_bytes());
         assert_eq!(key, expected);
         assert_eq!(key.len(), 10 + 20);
@@ -289,9 +288,8 @@ mod tests {
     fn object_key_golden_bytes_sha256() {
         let oid = sha256_oid();
         let key = object_key(RepoId(42), &oid);
-        let mut expected = vec![0x01u8];
+        let mut expected = vec![0x01u8, 0x01]; // segment = object, version
         expected.extend_from_slice(&42u64.to_be_bytes());
-        expected.push(0x01);
         expected.extend_from_slice(oid.as_bytes());
         assert_eq!(key, expected);
         assert_eq!(key.len(), 10 + 32);
@@ -311,9 +309,8 @@ mod tests {
     fn commit_key_golden_bytes() {
         let oid = sha1_oid();
         let key = commit_key(RepoId(1), &oid);
-        let mut expected = vec![0x01u8];
+        let mut expected = vec![0x03u8, 0x01]; // segment = commit-graph, version
         expected.extend_from_slice(&1u64.to_be_bytes());
-        expected.push(0x03); // segment = commit-graph
         expected.extend_from_slice(oid.as_bytes());
         assert_eq!(key, expected);
     }
@@ -331,9 +328,8 @@ mod tests {
     #[test]
     fn ref_key_golden_bytes() {
         let key = ref_key(RepoId(2), "refs/heads/main");
-        let mut expected = vec![0x01u8];
+        let mut expected = vec![0x02u8, 0x01]; // segment = ref, version
         expected.extend_from_slice(&2u64.to_be_bytes());
-        expected.push(0x02); // segment = ref
         expected.extend_from_slice(b"refs/heads/main");
         assert_eq!(key, expected);
     }
@@ -379,9 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn same_segment_keys_share_leading_prefix_across_repos() {
+        // The segment byte leads the key, so a segment is one contiguous
+        // keyspace prefix regardless of how many repositories exist.
+        let a = object_key(RepoId(1), &sha1_oid());
+        let b = object_key(RepoId(2), &sha256_oid());
+        let other_segment = ref_key(RepoId(1), "refs/heads/main");
+        assert_eq!(a[..2], b[..2]); // segment byte + version byte
+        assert_ne!(a[0], other_segment[0]);
+    }
+
+    #[test]
     fn decode_rejects_bad_version_byte() {
         let mut key = meta_key(RepoId(0), "schema-version");
-        key[0] = 0x02;
+        key[1] = 0x02;
         assert_eq!(
             decode_meta_key(&key),
             Err(KeyError::UnsupportedVersion(0x02))
@@ -391,7 +398,7 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_segment_byte() {
         let mut key = meta_key(RepoId(0), "schema-version");
-        key[9] = 0xff;
+        key[0] = 0xff;
         assert_eq!(decode_meta_key(&key), Err(KeyError::UnknownSegment(0xff)));
     }
 
@@ -409,7 +416,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_preamble() {
-        let key = vec![0x01u8, 0x00, 0x00, 0x00];
+        let key = vec![0x00u8, 0x01, 0x00, 0x00];
         assert_eq!(
             decode_meta_key(&key),
             Err(KeyError::TooShort {
