@@ -585,10 +585,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_round_trip_and_defaults() {
+    async fn should_create_repo_with_registry_defaults_and_round_trip_lookup() {
+        // given
         let store = memory_store().await;
 
+        // when
         let meta = store.create_repo("acme/widgets").await.expect("create");
+
+        // then
         assert_eq!(meta.id, RepoId(FIRST_REPO_ID));
         assert_eq!(meta.object_format, Kind::Sha1);
         assert_eq!(meta.default_branch, DEFAULT_BRANCH);
@@ -640,25 +644,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ids_increase_monotonically() {
+    async fn should_increase_repo_ids_monotonically() {
+        // given
         let store = memory_store().await;
+
+        // when
         let a = store.create_repo("a").await.expect("create a");
         let b = store.create_repo("b").await.expect("create b");
         let c = store.create_repo("org/c").await.expect("create c");
+
+        // then
         assert_eq!(a.id, RepoId(1));
         assert_eq!(b.id, RepoId(2));
         assert_eq!(c.id, RepoId(3));
     }
 
     #[tokio::test]
-    async fn create_is_idempotent_by_name() {
+    async fn should_return_existing_repo_on_duplicate_create() {
+        // given
         let store = memory_store().await;
         let first = store.create_repo("dup").await.expect("create");
+
+        // when
         // A second create for the same name returns the existing repo (this
         // exercises the in-transaction "already exists" branch), not a new id.
         let second = store.create_repo("dup").await.expect("recreate");
+
+        // then
         assert_eq!(first, second);
+
+        // when
         let via_goc = store.get_or_create_repo("dup").await.expect("goc");
+
+        // then
         assert_eq!(first, via_goc);
         // No extra id was allocated.
         assert_eq!(
@@ -671,7 +689,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_create_race_yields_one_repo() {
+    async fn should_yield_one_repo_id_under_concurrent_create_race() {
+        // given
         let store = memory_store().await;
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..8 {
@@ -679,12 +698,14 @@ mod tests {
             set.spawn(async move { store.get_or_create_repo("contended").await });
         }
 
+        // when
         let mut ids = HashSet::new();
         while let Some(joined) = set.join_next().await {
             let meta = joined.expect("task joined").expect("get_or_create");
             ids.insert(meta.id);
         }
 
+        // then
         // Every racer agreed on exactly one repo id...
         assert_eq!(ids.len(), 1);
         assert_eq!(ids.into_iter().next(), Some(RepoId(FIRST_REPO_ID)));
@@ -699,10 +720,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ref_crud_and_listing() {
+    async fn should_support_ref_crud_and_ordered_listing() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("refs-repo").await.expect("create").id;
 
+        // when
         store
             .put_ref(repo, "refs/heads/main", &RefTarget::Direct(oid(b'a')))
             .await
@@ -716,16 +739,20 @@ mod tests {
             .await
             .expect("put tag");
 
+        // then
         assert_eq!(
             store.get_ref(repo, "refs/heads/main").await.expect("get"),
             Some(RefTarget::Direct(oid(b'a')))
         );
 
+        // when
         // Prefix scan is ordered and excludes non-matching prefixes.
         let heads = store
             .list_refs(repo, Some("refs/heads/"))
             .await
             .expect("list heads");
+
+        // then
         assert_eq!(
             heads,
             vec![
@@ -734,18 +761,24 @@ mod tests {
             ]
         );
 
+        // when
         // Full listing is name-ordered; HEAD (from create) sorts before refs/*.
         let all = store.list_refs(repo, None).await.expect("list all");
         let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+
+        // then
         assert_eq!(
             names,
             vec!["HEAD", "refs/heads/dev", "refs/heads/main", "refs/tags/v1"]
         );
 
+        // when
         store
             .delete_ref(repo, "refs/heads/dev")
             .await
             .expect("delete");
+
+        // then
         assert_eq!(
             store.get_ref(repo, "refs/heads/dev").await.expect("get"),
             None
@@ -753,10 +786,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_create_update_and_delete() {
+    async fn should_apply_cas_create_update_and_delete() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("cas").await.expect("create").id;
 
+        // when
         // Create: expected_old = None (must not exist).
         let created = store
             .update_refs(
@@ -769,12 +804,15 @@ mod tests {
             )
             .await
             .expect("create ref");
+
+        // then
         assert_eq!(created[0].outcome, RefOutcome::Updated);
         assert_eq!(
             store.get_ref(repo, "refs/heads/main").await.expect("get"),
             Some(RefTarget::Direct(oid(b'1')))
         );
 
+        // when
         // Fast-forward update: expected_old matches.
         let updated = store
             .update_refs(
@@ -787,8 +825,11 @@ mod tests {
             )
             .await
             .expect("update ref");
+
+        // then
         assert_eq!(updated[0].outcome, RefOutcome::Updated);
 
+        // when
         // Delete: new = None.
         let deleted = store
             .update_refs(
@@ -801,6 +842,8 @@ mod tests {
             )
             .await
             .expect("delete ref");
+
+        // then
         assert_eq!(deleted[0].outcome, RefOutcome::Updated);
         assert_eq!(
             store.get_ref(repo, "refs/heads/main").await.expect("get"),
@@ -809,7 +852,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_rejects_stale_old_and_leaves_ref_untouched() {
+    async fn should_reject_cas_update_with_stale_old_oid() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("cas-stale").await.expect("create").id;
         store
@@ -817,6 +861,7 @@ mod tests {
             .await
             .expect("seed");
 
+        // when
         let results = store
             .update_refs(
                 repo,
@@ -828,6 +873,8 @@ mod tests {
             )
             .await
             .expect("cas");
+
+        // then
         assert_eq!(
             results[0].outcome,
             RefOutcome::Rejected(REASON_STALE.to_owned())
@@ -840,7 +887,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_create_must_not_exist_rejects_existing() {
+    async fn should_reject_cas_create_when_ref_already_exists() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("cas-exists").await.expect("create").id;
         store
@@ -848,6 +896,7 @@ mod tests {
             .await
             .expect("seed");
 
+        // when
         let results = store
             .update_refs(
                 repo,
@@ -859,6 +908,8 @@ mod tests {
             )
             .await
             .expect("cas");
+
+        // then
         assert_eq!(
             results[0].outcome,
             RefOutcome::Rejected(REASON_STALE.to_owned())
@@ -866,7 +917,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_partial_batch_commits_non_conflicting_commands() {
+    async fn should_commit_non_conflicting_commands_in_partial_cas_batch() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("cas-batch").await.expect("create").id;
         store
@@ -874,6 +926,7 @@ mod tests {
             .await
             .expect("seed keep");
 
+        // when
         let results = store
             .update_refs(
                 repo,
@@ -895,6 +948,7 @@ mod tests {
             .await
             .expect("cas batch");
 
+        // then
         assert_eq!(results[0].outcome, RefOutcome::Updated);
         assert_eq!(
             results[1].outcome,
@@ -913,9 +967,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_rejects_symbolic_target() {
+    async fn should_reject_cas_update_of_symbolic_ref() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("cas-symref").await.expect("create").id;
+
+        // when
         // HEAD is symbolic and must not be directly CAS-updated.
         let results = store
             .update_refs(
@@ -928,6 +985,8 @@ mod tests {
             )
             .await
             .expect("cas");
+
+        // then
         assert_eq!(
             results[0].outcome,
             RefOutcome::Rejected(REASON_SYMBOLIC.to_owned())
@@ -940,9 +999,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_round_trip() {
+    async fn should_round_trip_meta_values() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("meta").await.expect("create").id;
+
+        // when/then: each setting is its own put -> get -> compare cycle.
         for (name, value) in [
             ("string-setting", MetaValue::Utf8("hello".to_owned())),
             ("byte-setting", MetaValue::U8(7)),
@@ -955,6 +1017,8 @@ mod tests {
                 Some(value)
             );
         }
+
+        // then
         assert_eq!(
             store.get_meta(repo, "absent").await.expect("get meta"),
             None
@@ -962,33 +1026,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_and_commit_graph_round_trip() {
+    async fn should_round_trip_object_and_commit_graph_records() {
+        // given
         let store = memory_store().await;
         let repo = store.create_repo("objects").await.expect("create").id;
-
         let blob = oid(b'a');
+
+        // then
         assert!(!store.object_exists(repo, &blob).await.expect("exists"));
+
+        // when
         let record = ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello"));
         store
             .put_object(repo, &blob, &record)
             .await
             .expect("put object");
+
+        // then
         assert!(store.object_exists(repo, &blob).await.expect("exists"));
         assert_eq!(
             store.get_object(repo, &blob).await.expect("get object"),
             Some(record)
         );
 
+        // given
         let commit = oid(b'c');
         let graph = CommitGraphRecord {
             generation: 2,
             root_tree: oid(b'd'),
             parents: vec![oid(b'e')],
         };
+
+        // when
         store
             .put_commit_graph(repo, &commit, &graph)
             .await
             .expect("put graph");
+
+        // then
         assert_eq!(
             store
                 .get_commit_graph(repo, &commit)

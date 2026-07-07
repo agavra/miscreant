@@ -340,36 +340,49 @@ mod tests {
     // --- MetaValue ---
 
     #[test]
-    fn meta_value_utf8_golden_bytes() {
+    fn should_encode_meta_value_utf8_bytes_exactly() {
+        // given/when
         let v = MetaValue::Utf8("sha1".to_owned());
+
+        // then
         let mut expected = vec![0x01u8];
         expected.extend_from_slice(b"sha1");
         assert_eq!(v.encode(), expected);
     }
 
     #[test]
-    fn meta_value_u8_golden_bytes() {
+    fn should_encode_meta_value_u8_bytes_exactly() {
+        // given/when
         let v = MetaValue::U8(7);
+
+        // then
         assert_eq!(v.encode(), vec![0x02, 0x07]);
     }
 
     #[test]
-    fn meta_value_u32_golden_bytes() {
+    fn should_encode_meta_value_u32_bytes_exactly() {
+        // given/when
         let v = MetaValue::U32(1);
+
+        // then
         assert_eq!(v.encode(), vec![0x03, 0x00, 0x00, 0x00, 0x01]);
     }
 
     #[test]
-    fn meta_value_raw_golden_bytes() {
+    fn should_encode_meta_value_raw_bytes_exactly() {
+        // given/when
         // e.g. next-repo-id / repo:<name> per Fixed decisions: raw u64 BE.
         let v = MetaValue::Raw(1u64.to_be_bytes().to_vec());
+
+        // then
         let mut expected = vec![0x04u8];
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
         assert_eq!(v.encode(), expected);
     }
 
     #[test]
-    fn meta_value_round_trips() {
+    fn should_round_trip_every_meta_value_variant() {
+        // given/when/then: each variant is its own encode -> decode -> compare cycle.
         for v in [
             MetaValue::Utf8("refs/heads/main".to_owned()),
             MetaValue::U8(3),
@@ -381,47 +394,70 @@ mod tests {
     }
 
     #[test]
-    fn meta_value_rejects_unknown_tag() {
-        assert_eq!(
-            MetaValue::decode(&[0xff]),
-            Err(ValueError::UnknownTag(0xff))
-        );
+    fn should_reject_unknown_meta_value_tag() {
+        // given
+        let bytes = [0xffu8];
+
+        // when
+        let result = MetaValue::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::UnknownTag(0xff)));
     }
 
     #[test]
-    fn meta_value_rejects_empty() {
-        assert_eq!(MetaValue::decode(&[]), Err(ValueError::Empty));
+    fn should_reject_empty_meta_value() {
+        // given/when
+        let result = MetaValue::decode(&[]);
+
+        // then
+        assert_eq!(result, Err(ValueError::Empty));
     }
 
     #[test]
-    fn meta_value_rejects_truncated_u32() {
-        assert_eq!(
-            MetaValue::decode(&[0x03, 0x00, 0x00]),
-            Err(ValueError::Truncated)
-        );
+    fn should_reject_truncated_meta_value_u32() {
+        // given
+        let bytes = [0x03, 0x00, 0x00];
+
+        // when
+        let result = MetaValue::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::Truncated));
     }
 
     #[test]
-    fn meta_value_rejects_trailing_bytes_u8() {
-        assert_eq!(
-            MetaValue::decode(&[0x02, 0x01, 0x02]),
-            Err(ValueError::TrailingBytes)
-        );
+    fn should_reject_meta_value_u8_with_trailing_bytes() {
+        // given
+        let bytes = [0x02, 0x01, 0x02];
+
+        // when
+        let result = MetaValue::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::TrailingBytes));
     }
 
     #[test]
-    fn meta_value_rejects_invalid_utf8() {
-        assert_eq!(
-            MetaValue::decode(&[0x01, 0xff]),
-            Err(ValueError::InvalidUtf8)
-        );
+    fn should_reject_invalid_utf8_meta_value() {
+        // given
+        let bytes = [0x01, 0xff];
+
+        // when
+        let result = MetaValue::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::InvalidUtf8));
     }
 
     // --- ObjectRecord ---
 
     #[test]
-    fn object_record_blob_inline_golden_bytes() {
+    fn should_encode_blob_inline_record_bytes_exactly() {
+        // given/when
         let record = ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello"));
+
+        // then
         let mut expected = vec![0x01u8];
         expected.extend_from_slice(b"blob 5\0hello");
         assert_eq!(record.encode(), expected);
@@ -430,8 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn object_record_blob_pointer_golden_bytes() {
+    fn should_encode_blob_pointer_record_bytes_exactly() {
+        // given/when
         let record = ObjectRecord::BlobPointer { size: 131_072 };
+
+        // then
         let mut expected = vec![0x02u8];
         expected.extend_from_slice(&131_072u64.to_be_bytes());
         assert_eq!(record.encode(), expected);
@@ -440,9 +479,12 @@ mod tests {
     }
 
     #[test]
-    fn object_record_tree_golden_bytes() {
+    fn should_encode_tree_record_bytes_exactly() {
+        // given/when
         let body = Bytes::from_static(b"tree-body-bytes");
         let record = ObjectRecord::Tree(body.clone());
+
+        // then
         let mut expected = vec![0x03u8];
         expected.extend_from_slice(&body);
         assert_eq!(record.encode(), expected);
@@ -451,9 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn object_record_commit_golden_bytes() {
+    fn should_encode_commit_record_bytes_exactly() {
+        // given/when
         let body = Bytes::from_static(b"commit-body-bytes");
         let record = ObjectRecord::Commit(body.clone());
+
+        // then
         let mut expected = vec![0x04u8];
         expected.extend_from_slice(&body);
         assert_eq!(record.encode(), expected);
@@ -461,9 +506,12 @@ mod tests {
     }
 
     #[test]
-    fn object_record_tag_golden_bytes() {
+    fn should_encode_tag_record_bytes_exactly() {
+        // given/when
         let body = Bytes::from_static(b"tag-body-bytes");
         let record = ObjectRecord::Tag(body.clone());
+
+        // then
         let mut expected = vec![0x05u8];
         expected.extend_from_slice(&body);
         assert_eq!(record.encode(), expected);
@@ -471,7 +519,8 @@ mod tests {
     }
 
     #[test]
-    fn object_record_round_trips() {
+    fn should_round_trip_every_object_record_variant() {
+        // given/when/then: each variant is its own encode -> decode -> compare cycle.
         for record in [
             ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello")),
             ObjectRecord::BlobPointer { size: 999 },
@@ -487,64 +536,92 @@ mod tests {
     }
 
     #[test]
-    fn object_record_rejects_unknown_tag() {
-        assert_eq!(
-            ObjectRecord::decode(&[0x00]),
-            Err(ValueError::UnknownTag(0x00))
-        );
+    fn should_reject_unknown_object_record_tag() {
+        // given
+        let bytes = [0x00u8];
+
+        // when
+        let result = ObjectRecord::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::UnknownTag(0x00)));
     }
 
     #[test]
-    fn object_record_rejects_empty() {
-        assert_eq!(ObjectRecord::decode(&[]), Err(ValueError::Empty));
+    fn should_reject_empty_object_record() {
+        // given/when
+        let result = ObjectRecord::decode(&[]);
+
+        // then
+        assert_eq!(result, Err(ValueError::Empty));
     }
 
     #[test]
-    fn object_record_rejects_truncated_pointer() {
-        assert_eq!(
-            ObjectRecord::decode(&[0x02, 0x00, 0x00]),
-            Err(ValueError::Truncated)
-        );
+    fn should_reject_truncated_blob_pointer_record() {
+        // given
+        let bytes = [0x02, 0x00, 0x00];
+
+        // when
+        let result = ObjectRecord::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::Truncated));
     }
 
     #[test]
-    fn object_record_rejects_trailing_bytes_on_pointer() {
+    fn should_reject_blob_pointer_record_with_trailing_bytes() {
+        // given
         let mut bytes = vec![0x02u8];
         bytes.extend_from_slice(&99u64.to_be_bytes());
         bytes.push(0xAA);
-        assert_eq!(ObjectRecord::decode(&bytes), Err(ValueError::TrailingBytes));
+
+        // when
+        let result = ObjectRecord::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::TrailingBytes));
     }
 
     // --- RefTarget ---
 
     #[test]
-    fn ref_target_direct_golden_bytes_sha1() {
+    fn should_encode_direct_ref_target_bytes_exactly_sha1() {
+        // given
         let oid = sha1_oid(SHA1_A);
         let target = RefTarget::Direct(oid);
+
+        // when/then
         let mut expected = vec![0x01u8];
         expected.extend_from_slice(oid.as_bytes());
         assert_eq!(target.encode(), expected);
     }
 
     #[test]
-    fn ref_target_direct_golden_bytes_sha256() {
+    fn should_encode_direct_ref_target_bytes_exactly_sha256() {
+        // given
         let oid = sha256_oid(SHA256_A);
         let target = RefTarget::Direct(oid);
+
+        // when/then
         let mut expected = vec![0x01u8];
         expected.extend_from_slice(oid.as_bytes());
         assert_eq!(target.encode(), expected);
     }
 
     #[test]
-    fn ref_target_reference_golden_bytes() {
+    fn should_encode_reference_ref_target_bytes_exactly() {
+        // given/when
         let target = RefTarget::Reference("refs/heads/main".to_owned());
+
+        // then
         let mut expected = vec![0x02u8];
         expected.extend_from_slice(b"refs/heads/main");
         assert_eq!(target.encode(), expected);
     }
 
     #[test]
-    fn ref_target_round_trips_both_widths() {
+    fn should_round_trip_ref_target_at_both_hash_widths() {
+        // given/when/then: each direct oid is its own encode -> decode -> compare cycle.
         for oid in [sha1_oid(SHA1_A), sha256_oid(SHA256_A)] {
             let target = RefTarget::Direct(oid);
             assert_eq!(
@@ -552,6 +629,8 @@ mod tests {
                 target
             );
         }
+
+        // given/when/then: same cycle for a symbolic reference.
         let symref = RefTarget::Reference("HEAD-target".to_owned());
         assert_eq!(
             RefTarget::decode(&symref.encode()).expect("decodes"),
@@ -560,39 +639,56 @@ mod tests {
     }
 
     #[test]
-    fn ref_target_rejects_unknown_tag() {
-        assert_eq!(
-            RefTarget::decode(&[0x03]),
-            Err(ValueError::UnknownTag(0x03))
-        );
+    fn should_reject_unknown_ref_target_tag() {
+        // given
+        let bytes = [0x03u8];
+
+        // when
+        let result = RefTarget::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::UnknownTag(0x03)));
     }
 
     #[test]
-    fn ref_target_rejects_truncated_direct() {
+    fn should_reject_truncated_direct_ref_target() {
+        // given
         let oid = sha1_oid(SHA1_A);
         let mut bytes = vec![0x01u8];
         bytes.extend_from_slice(&oid.as_bytes()[..19]);
-        assert_eq!(RefTarget::decode(&bytes), Err(ValueError::InvalidObjectId));
+
+        // when
+        let result = RefTarget::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::InvalidObjectId));
     }
 
     #[test]
-    fn ref_target_rejects_invalid_utf8_reference() {
-        assert_eq!(
-            RefTarget::decode(&[0x02, 0xff]),
-            Err(ValueError::InvalidUtf8)
-        );
+    fn should_reject_invalid_utf8_reference_target() {
+        // given
+        let bytes = [0x02, 0xff];
+
+        // when
+        let result = RefTarget::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::InvalidUtf8));
     }
 
     // --- CommitGraphRecord ---
 
     #[test]
-    fn commit_graph_record_golden_bytes_root_commit_sha1() {
+    fn should_encode_root_commit_graph_record_bytes_exactly_sha1() {
+        // given
         let root_tree = sha1_oid(SHA1_A);
         let record = CommitGraphRecord {
             generation: 1,
             root_tree,
             parents: vec![],
         };
+
+        // when/then
         let mut expected = vec![0x00, 0x00, 0x00, 0x01]; // generation = 1
         expected.extend_from_slice(root_tree.as_bytes());
         expected.push(0x00); // parent_count = 0
@@ -600,7 +696,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_graph_record_golden_bytes_merge_sha1() {
+    fn should_encode_merge_commit_graph_record_bytes_exactly_sha1() {
+        // given
         let root_tree = sha1_oid(SHA1_A);
         let parent_a = sha1_oid(SHA1_B);
         let parent_b = sha1_oid(SHA1_A);
@@ -609,6 +706,8 @@ mod tests {
             root_tree,
             parents: vec![parent_a, parent_b],
         };
+
+        // when/then
         let mut expected = vec![0x00, 0x00, 0x00, 0x03]; // generation = 3
         expected.extend_from_slice(root_tree.as_bytes());
         expected.push(0x02); // parent_count = 2
@@ -618,7 +717,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_graph_record_golden_bytes_sha256() {
+    fn should_encode_commit_graph_record_bytes_exactly_sha256() {
+        // given
         let root_tree = sha256_oid(SHA256_A);
         let parent = sha256_oid(SHA256_B);
         let record = CommitGraphRecord {
@@ -626,6 +726,8 @@ mod tests {
             root_tree,
             parents: vec![parent],
         };
+
+        // when/then
         let mut expected = vec![0x00, 0x00, 0x00, 0x02];
         expected.extend_from_slice(root_tree.as_bytes());
         expected.push(0x01);
@@ -634,23 +736,29 @@ mod tests {
     }
 
     #[test]
-    fn commit_graph_record_round_trips_both_widths() {
+    fn should_round_trip_commit_graph_record_at_both_hash_widths() {
+        // given
         let sha1_record = CommitGraphRecord {
             generation: 5,
             root_tree: sha1_oid(SHA1_A),
             parents: vec![sha1_oid(SHA1_B)],
         };
+
+        // when/then
         assert_eq!(
             CommitGraphRecord::decode(&sha1_record.encode(), gix_hash::Kind::Sha1)
                 .expect("decodes"),
             sha1_record
         );
 
+        // given
         let sha256_record = CommitGraphRecord {
             generation: 6,
             root_tree: sha256_oid(SHA256_A),
             parents: vec![sha256_oid(SHA256_B), sha256_oid(SHA256_A)],
         };
+
+        // when/then
         assert_eq!(
             CommitGraphRecord::decode(&sha256_record.encode(), gix_hash::Kind::Sha256)
                 .expect("decodes"),
@@ -659,15 +767,20 @@ mod tests {
     }
 
     #[test]
-    fn commit_graph_record_rejects_truncated_header() {
-        assert_eq!(
-            CommitGraphRecord::decode(&[0x00, 0x00, 0x00, 0x01], gix_hash::Kind::Sha1),
-            Err(ValueError::Truncated)
-        );
+    fn should_reject_truncated_commit_graph_header() {
+        // given
+        let bytes = [0x00, 0x00, 0x00, 0x01];
+
+        // when
+        let result = CommitGraphRecord::decode(&bytes, gix_hash::Kind::Sha1);
+
+        // then
+        assert_eq!(result, Err(ValueError::Truncated));
     }
 
     #[test]
-    fn commit_graph_record_rejects_truncated_parents() {
+    fn should_reject_truncated_commit_graph_parents() {
+        // given
         let record = CommitGraphRecord {
             generation: 2,
             root_tree: sha1_oid(SHA1_A),
@@ -675,14 +788,17 @@ mod tests {
         };
         let mut bytes = record.encode();
         bytes.truncate(bytes.len() - 5);
-        assert_eq!(
-            CommitGraphRecord::decode(&bytes, gix_hash::Kind::Sha1),
-            Err(ValueError::Truncated)
-        );
+
+        // when
+        let result = CommitGraphRecord::decode(&bytes, gix_hash::Kind::Sha1);
+
+        // then
+        assert_eq!(result, Err(ValueError::Truncated));
     }
 
     #[test]
-    fn commit_graph_record_rejects_trailing_bytes() {
+    fn should_reject_commit_graph_record_with_trailing_bytes() {
+        // given
         let record = CommitGraphRecord {
             generation: 1,
             root_tree: sha1_oid(SHA1_A),
@@ -690,9 +806,11 @@ mod tests {
         };
         let mut bytes = record.encode();
         bytes.push(0xAA);
-        assert_eq!(
-            CommitGraphRecord::decode(&bytes, gix_hash::Kind::Sha1),
-            Err(ValueError::TrailingBytes)
-        );
+
+        // when
+        let result = CommitGraphRecord::decode(&bytes, gix_hash::Kind::Sha1);
+
+        // then
+        assert_eq!(result, Err(ValueError::TrailingBytes));
     }
 }
