@@ -4,4 +4,7 @@
 //! implements.
 
 pub mod keys;
+pub mod store;
 pub mod values;
+
+pub use store::{RefOutcome, RefUpdate, RefUpdateResult, RepoMeta, Store, StoreError};
