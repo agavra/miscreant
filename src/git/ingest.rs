@@ -7,10 +7,10 @@
 //! anything reaches committed storage. The temporary directory is deleted
 //! when the request completes, success or failure.
 
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use gix_features::progress::Discard;
@@ -18,10 +18,10 @@ use gix_features::zlib;
 use gix_hash::{ObjectId, oid};
 use gix_object::Kind;
 use gix_pack::Bundle;
+use gix_pack::data::entry::Header;
+use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 
-use crate::storage::keys::RepoId;
 use crate::storage::store::RepoMeta;
 use crate::storage::{ObjectDb, ObjectDbError};
 
@@ -154,119 +154,177 @@ fn kind_at(bundle: &Bundle, offset: u64, id: &oid) -> Result<Kind, IngestError> 
 /// Stream a received pack into a fresh temporary directory under
 /// `staging_root`, resolving deltas and verifying the pack checksum as it is
 /// indexed. Thin-pack bases (git clients delta against objects they know the
-/// server has) are fetched from `objectdb` under `repo` and inlined into the
-/// staged pack. Zero input bytes and a zero-object pack are both valid and
-/// yield an empty [`StagedPack`]: delete-only pushes send no objects.
+/// server has) are prefetched from `objectdb` under `repo` before indexing,
+/// then served from an in-memory map while the pack is written. Zero input
+/// bytes and a zero-object pack are both valid and yield an empty
+/// [`StagedPack`]: delete-only pushes send no objects.
 pub async fn ingest_pack(
     input: impl Read + Send + 'static,
     objectdb: &ObjectDb,
     repo: &RepoMeta,
     staging_root: &Path,
 ) -> Result<StagedPack, IngestError> {
-    let lookup_error = Arc::new(Mutex::new(None));
-    let lookup = ObjectDbLookup {
-        db: objectdb.clone(),
-        repo: repo.id,
-        handle: Handle::current(),
-        error: Arc::clone(&lookup_error),
-    };
     let object_hash = repo.object_format;
     let staging_root = staging_root.to_path_buf();
 
-    let staged = tokio::task::spawn_blocking(move || {
-        ingest_blocking(input, lookup, object_hash, &staging_root)
+    // Spool the incoming stream to disk and scan its entry headers for
+    // ref-delta base ids. Both steps are synchronous (`Read`/`BufRead`), so
+    // they run on the blocking pool; nothing here touches `objectdb` yet.
+    let spooled =
+        tokio::task::spawn_blocking(move || spool_and_scan(input, object_hash, &staging_root))
+            .await??;
+
+    let Some(pack_path) = spooled.pack_path else {
+        return Ok(StagedPack {
+            _tempdir: spooled.tempdir,
+            bundle: None,
+        });
+    };
+
+    // Prefetch every distinct ref-delta base from committed storage. A
+    // store failure surfaces immediately with its real cause; a base that
+    // simply isn't there is omitted — gix decides later whether that makes
+    // the pack invalid.
+    let mut bases = HashMap::with_capacity(spooled.ref_delta_bases.len());
+    for base_id in spooled.ref_delta_bases {
+        if let Some(object) = objectdb.get(repo.id, &base_id).await? {
+            bases.insert(base_id, object);
+        }
+    }
+
+    let tempdir = spooled.tempdir;
+    let (tempdir, bundle) = tokio::task::spawn_blocking(move || {
+        let bundle = write_bundle(&pack_path, tempdir.path(), object_hash, bases);
+        (tempdir, bundle)
     })
     .await?;
 
-    // A failed (as opposed to unsuccessful) base lookup is reported to the
-    // pack iterator as "not found" — see `ObjectDbLookup` — so the recorded
-    // storage error supersedes whatever the pack machinery derived from it.
-    if let Some(db_error) = lookup_error.lock().ok().and_then(|mut slot| slot.take()) {
-        return Err(IngestError::BaseLookup(db_error));
-    }
-    staged
+    Ok(StagedPack {
+        _tempdir: tempdir,
+        bundle: bundle?,
+    })
 }
 
-/// The synchronous body of [`ingest_pack`], run on the blocking pool.
-fn ingest_blocking(
-    input: impl Read,
-    lookup: ObjectDbLookup,
+/// The spooled pack file plus the ref-delta base ids found while scanning
+/// its entry headers, still inside the staging tempdir that owns them.
+struct Spooled {
+    tempdir: TempDir,
+    /// `None` when zero bytes were spooled (a delete-only push).
+    pack_path: Option<PathBuf>,
+    ref_delta_bases: HashSet<ObjectId>,
+}
+
+/// Copy `input` into a fresh file inside a new tempdir under `staging_root`,
+/// then scan the spooled pack's entry headers to collect every `RefDelta`
+/// base id. Scanning never resolves deltas or hashes the pack: it uses
+/// [`Mode::AsIs`] and discards entry bytes, so a corrupt or truncated pack
+/// simply yields whatever bases were found before the scan gave up —
+/// [`write_bundle`] performs the real, verifying pass and reports the
+/// authoritative error.
+fn spool_and_scan(
+    mut input: impl Read,
     object_hash: gix_hash::Kind,
     staging_root: &Path,
-) -> Result<StagedPack, IngestError> {
+) -> Result<Spooled, IngestError> {
     std::fs::create_dir_all(staging_root)?;
     let tempdir = TempDir::new_in(staging_root)?;
+    let pack_path = tempdir.path().join("received.pack");
 
-    // A delete-only push may send no pack at all: zero input bytes are an
-    // empty pack.
-    let mut reader = BufReader::new(input);
-    if reader.fill_buf()?.is_empty() {
-        return Ok(StagedPack {
-            _tempdir: tempdir,
-            bundle: None,
+    let bytes_spooled = std::io::copy(&mut input, &mut std::fs::File::create(&pack_path)?)?;
+    if bytes_spooled == 0 {
+        return Ok(Spooled {
+            tempdir,
+            pack_path: None,
+            ref_delta_bases: HashSet::new(),
         });
     }
 
+    let ref_delta_bases = scan_ref_delta_bases(&pack_path, object_hash)?;
+    Ok(Spooled {
+        tempdir,
+        pack_path: Some(pack_path),
+        ref_delta_bases,
+    })
+}
+
+/// Scan every entry header in the pack at `pack_path`, collecting the base
+/// ids of `RefDelta` entries. A malformed header or a decode failure part
+/// way through just truncates what is collected here; it does not surface
+/// as an error, since [`write_bundle`]'s verifying pass will hit the same
+/// problem and report it properly.
+fn scan_ref_delta_bases(
+    pack_path: &Path,
+    object_hash: gix_hash::Kind,
+) -> Result<HashSet<ObjectId>, IngestError> {
+    let reader = BufReader::new(std::fs::File::open(pack_path)?);
+    let entries = match BytesToEntriesIter::new_from_header(
+        reader,
+        Mode::AsIs,
+        EntryDataMode::Ignore,
+        object_hash,
+    ) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(HashSet::new()),
+    };
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| match entry.header {
+            Header::RefDelta { base_id } => Some(base_id),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The synchronous body of [`ingest_pack`]'s indexing step, run on the
+/// blocking pool. `bases` is the already-prefetched, infallible lookup for
+/// any ref-delta bases the pack references.
+fn write_bundle(
+    pack_path: &Path,
+    directory: &Path,
+    object_hash: gix_hash::Kind,
+    bases: HashMap<ObjectId, (Kind, Bytes)>,
+) -> Result<Option<Bundle>, IngestError> {
+    let mut reader = BufReader::new(std::fs::File::open(pack_path)?);
     let should_interrupt = AtomicBool::new(false);
     let outcome = Bundle::write_to_directory(
         &mut reader,
-        Some(tempdir.path()),
+        Some(directory),
         &mut Discard,
         &should_interrupt,
-        Some(lookup),
+        Some(PrefetchedBases(bases)),
         gix_pack::bundle::write::Options {
             thread_limit: None,
-            iteration_mode: gix_pack::data::input::Mode::Verify,
+            iteration_mode: Mode::Verify,
             index_version: gix_pack::index::Version::default(),
             object_hash,
         },
     )?;
 
     // A zero-object pack produces no `.pack`/`.idx` files at all.
-    let bundle = outcome.to_bundle().transpose()?;
-    Ok(StagedPack {
-        _tempdir: tempdir,
-        bundle,
-    })
+    Ok(outcome.to_bundle().transpose()?)
 }
 
-/// Thin-pack base lookup: fetches canonical object bytes from committed
-/// storage so ref-delta entries can be resolved against them.
-struct ObjectDbLookup {
-    db: ObjectDb,
-    repo: RepoId,
-    handle: Handle,
-    error: Arc<Mutex<Option<ObjectDbError>>>,
-}
+/// Thin-pack base lookup backed by objects fetched from committed storage
+/// ahead of time. Infallible by construction: a miss just means the base
+/// wasn't prefetched (either it doesn't exist, or the pack never referenced
+/// it), which `gix_pack` reports as the usual "base not found" pack error.
+struct PrefetchedBases(HashMap<ObjectId, (Kind, Bytes)>);
 
-impl gix_object::Find for ObjectDbLookup {
+impl gix_object::Find for PrefetchedBases {
     fn try_find<'a>(
         &self,
         id: &oid,
         buffer: &'a mut Vec<u8>,
     ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
-        match self.handle.block_on(self.db.get(self.repo, id)) {
-            Ok(Some((kind, body))) => {
-                buffer.clear();
-                buffer.extend_from_slice(&body);
-                Ok(Some(gix_object::Data {
-                    kind,
-                    object_hash: id.kind(),
-                    data: buffer.as_slice(),
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(err) => {
-                // The pack iterator swallows lookup `Err`s by ending
-                // iteration early, which would stage a silently truncated
-                // pack. Record the failure and report "not found" instead:
-                // that surfaces as a hard error, which `ingest_pack` then
-                // replaces with the recorded cause.
-                if let Ok(mut slot) = self.error.lock() {
-                    slot.get_or_insert(err);
-                }
-                Ok(None)
-            }
-        }
+        let Some((kind, body)) = self.0.get(id) else {
+            return Ok(None);
+        };
+        buffer.clear();
+        buffer.extend_from_slice(body);
+        Ok(Some(gix_object::Data {
+            kind: *kind,
+            object_hash: id.kind(),
+            data: buffer.as_slice(),
+        }))
     }
 }

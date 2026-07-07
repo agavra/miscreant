@@ -1,7 +1,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -72,6 +72,20 @@ fn repetitive_body(lines: usize) -> Vec<u8> {
 
 fn absent_oid() -> ObjectId {
     ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("valid hex")
+}
+
+/// A `Read` that only ever hands back a few bytes per call, regardless of
+/// the caller's buffer size, to exercise spooling from a source that
+/// delivers the pack in many small chunks.
+struct SmallChunks {
+    remaining: Cursor<Vec<u8>>,
+}
+
+impl Read for SmallChunks {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let capped = buf.len().min(3);
+        self.remaining.read(&mut buf[..capped])
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,6 +167,36 @@ async fn should_resolve_thin_pack_bases_from_committed_objects() {
         assert_eq!(read_kind, kind);
         assert_eq!(read_body, Bytes::from(body));
     }
+
+    // then: the base commit and tree are never referenced by any delta and
+    // never travelled in the thin pack itself, so they stay absent from the
+    // resolved pack
+    let base_objects = rev_objects(&fx.repo_dir, &[&base]);
+    let (base_blob_oid, _, _) = base_objects
+        .iter()
+        .find(|(_, kind, _)| *kind == Kind::Blob)
+        .expect("base fixture has exactly one blob");
+    for (oid, kind, _) in &base_objects {
+        if oid == base_blob_oid {
+            continue;
+        }
+        assert!(
+            !staged.contains(oid),
+            "unreferenced base {kind:?} {oid} should not be packed"
+        );
+    }
+
+    // then: the base blob *is* present in the resolved pack — not because
+    // the thin pack carried it (it was excluded via `^{base}`), but because
+    // gix embeds a resolved thin-pack base to make the staged pack
+    // self-contained. Its body matching the original content proves those
+    // bytes came from the prefetched ObjectDb entry.
+    let (blob_kind, blob_body) = staged
+        .read(base_blob_oid)
+        .expect("read")
+        .expect("resolved base blob present");
+    assert_eq!(blob_kind, Kind::Blob);
+    assert_eq!(blob_body, Bytes::from(base_body));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -254,6 +298,36 @@ async fn should_accept_absent_pack_bytes() {
     // then
     assert_eq!(staged.object_count(), 0);
     assert!(staged.read(&absent_oid()).expect("read").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_ingest_a_pack_delivered_in_small_chunks() {
+    // given: a full pack fed through a reader that only ever yields a
+    // handful of bytes per call
+    let fx = fixture();
+    commit_file(&fx.repo_dir, "a.txt", b"alpha\n", "add a");
+    let head = commit_file(&fx.repo_dir, "b/nested.txt", b"beta\n", "add b");
+    let pack = pack_revs(&fx.repo_dir, &[], &[&head]);
+    let expected = rev_objects(&fx.repo_dir, &[&head]);
+    let (db, meta) = memory_objectdb("ingest/small-chunks").await;
+    let reader = SmallChunks {
+        remaining: Cursor::new(pack),
+    };
+
+    // when
+    let staged = ingest_pack(reader, &db, &meta, &fx.staging)
+        .await
+        .expect("ingest chunked pack");
+
+    // then: spooling reassembled the full stream, so every object is
+    // present with the right kind and body
+    assert_eq!(staged.object_count() as usize, expected.len());
+    for (oid, kind, body) in &expected {
+        assert!(staged.contains(oid), "missing {oid}");
+        let (read_kind, read_body) = staged.read(oid).expect("read").expect("object present");
+        assert_eq!(read_kind, *kind);
+        assert_eq!(read_body, Bytes::from(body.clone()));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
