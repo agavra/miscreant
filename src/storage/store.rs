@@ -12,7 +12,7 @@ use gix_hash::{Kind, ObjectId, oid};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::prefix::PrefixStore;
 use slatedb::object_store::{self, ObjectStore};
-use slatedb::{Db, ErrorKind, IsolationLevel};
+use slatedb::{Db, ErrorKind, IsolationLevel, PrefixExtractor, PrefixTarget};
 use url::Url;
 
 use crate::storage::keys::{self, KeyError, RepoId, Segment};
@@ -22,6 +22,31 @@ use crate::storage::values::{CommitGraphRecord, MetaValue, ObjectRecord, RefTarg
 /// blobs (added in a later change) live under a sibling prefix of the same
 /// root store, so a single bucket hosts both.
 const SLATEDB_PREFIX: &str = "slatedb";
+
+/// Routes every key to one of the four fixed segments by its leading segment
+/// byte (see `docs/0001-init.md` §Key Preamble), enabling SlateDB's segmented
+/// compaction with exactly four segments shared by all repositories.
+///
+/// The extractor is fixed for the life of a database: SlateDB persists
+/// `name()` in the manifest and refuses to open when it changes, so any
+/// future change to segmentation requires a new store and a migration.
+struct SegmentExtractor;
+
+impl PrefixExtractor for SegmentExtractor {
+    fn name(&self) -> &str {
+        "miscreant-segment-v1"
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        // Fixed one-byte extraction is safe for point keys and for every
+        // scan prefix of at least one byte, which all `keys` builders
+        // guarantee.
+        let bytes = match target {
+            PrefixTarget::Point(bytes) | PrefixTarget::Prefix(bytes) => bytes,
+        };
+        (!bytes.is_empty()).then_some(1)
+    }
+}
 
 /// Prefix of a server-global `repo:<name>` mapping key.
 const META_REPO_PREFIX: &str = "repo:";
@@ -160,7 +185,10 @@ impl Store {
     /// store handle is retained for later blob offload.
     pub async fn open(storage_url: &str) -> Result<Self, StoreError> {
         let root_store = resolve_root_store(storage_url)?;
-        let db = Db::open(Path::from(SLATEDB_PREFIX), root_store.clone()).await?;
+        let db = Db::builder(Path::from(SLATEDB_PREFIX), root_store.clone())
+            .with_segment_extractor(Arc::new(SegmentExtractor))
+            .build()
+            .await?;
         Ok(Self {
             db: Arc::new(db),
             root_store,
@@ -1079,5 +1107,25 @@ mod tests {
                 .expect("get graph"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn should_reopen_store_with_persisted_segment_extractor() {
+        // given: a store on durable (file-backed) storage with one repo,
+        // cleanly closed so the manifest (which records the segment
+        // extractor's name) is persisted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("file://{}", dir.path().display());
+        let store = Store::open(&url).await.expect("first open");
+        let created = store.create_repo("acme/widgets").await.expect("create");
+        store.close().await.expect("close");
+
+        // when: reopening the same database.
+        let reopened = Store::open(&url).await.expect("reopen");
+        let found = reopened.lookup_repo("acme/widgets").await.expect("lookup");
+
+        // then: the open succeeded against the persisted extractor name and
+        // the data is intact.
+        assert_eq!(found.map(|meta| meta.id), Some(created.id));
     }
 }

@@ -5,11 +5,6 @@ Miscreant. See `docs/0001-init.md` for the design.
 
 ## Storage
 
-- **Logical segments only.** SlateDB has no public physical-segment API yet
-  (segment-oriented compaction, RFC 0024). The design's four "segments"
-  (metadata, object, ref, commit-graph) are realized logically via the leading
-  segment byte in every key, sharing one LSM tree. Adopt physical segments
-  once SlateDB exposes them.
 - **SHA-256 not wired end to end.** Key/value codecs are width-generic, but
   `Store::create_repo` always stamps `object-format=sha1`, so the server only
   ever creates and serves SHA-1 repositories. Creating/advertising SHA-256
