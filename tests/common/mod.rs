@@ -1,6 +1,10 @@
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+
+use gix_hash::ObjectId;
+use gix_object::Kind;
 
 use miscreant::storage::Store;
 use miscreant::{AppState, Config, app};
@@ -20,6 +24,7 @@ pub fn test_config() -> Config {
 
 /// An in-process server instance bound to an ephemeral port, plus a scratch
 /// directory for the duration of the test.
+#[allow(dead_code)]
 pub struct TestServer {
     addr: SocketAddr,
     tempdir: TempDir,
@@ -27,6 +32,7 @@ pub struct TestServer {
     handle: JoinHandle<()>,
 }
 
+#[allow(dead_code)]
 impl TestServer {
     /// Bind `127.0.0.1:0` and serve the app in a background task.
     pub async fn spawn(config: Config) -> TestServer {
@@ -72,12 +78,12 @@ impl Drop for TestServer {
     }
 }
 
-/// Run the real `git` CLI in `dir` with a hermetic environment: protocol v2
-/// forced, system config disabled, and `HOME` pointed at `dir` so host git
-/// configuration cannot leak into tests.
-#[allow(dead_code)]
-pub fn git(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
+/// Build a real `git` CLI invocation in `dir` with a hermetic environment:
+/// protocol v2 forced, system config disabled, and `HOME` pointed at `dir`
+/// so host git configuration cannot leak into tests.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "protocol.version=2",
@@ -87,7 +93,144 @@ pub fn git(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", dir)
-        .output()
-        .expect("run git")
+        .env("HOME", dir);
+    command
+}
+
+/// Run the real `git` CLI in `dir` (see [`git_command`] for the environment).
+#[allow(dead_code)]
+pub fn git(dir: &Path, args: &[&str]) -> Output {
+    git_command(dir, args).output().expect("run git")
+}
+
+/// Run `git` in `dir`, asserting success and returning stdout.
+#[allow(dead_code)]
+pub fn git_ok(dir: &Path, args: &[&str]) -> Vec<u8> {
+    let output = git(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Like [`git_ok`], but feeding `input` to stdin (e.g. `pack-objects --revs`
+/// or `cat-file --batch`).
+#[allow(dead_code)]
+pub fn git_ok_with_input(dir: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+    let mut child = git_command(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input)
+        .expect("write git stdin");
+    let output = child.wait_with_output().expect("wait for git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Create an empty git repository at `dir` (made on demand) with `main` as
+/// the initial branch.
+#[allow(dead_code)]
+pub fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("create repo dir");
+    git_ok(dir, &["init", "-q", "-b", "main"]);
+}
+
+/// Write `contents` to `path` (relative to the repo), stage exactly that
+/// file, and commit it. Returns the new commit's hex id.
+#[allow(dead_code)]
+pub fn commit_file(dir: &Path, path: &str, contents: &[u8], message: &str) -> String {
+    let file = dir.join(path);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).expect("create file parent dir");
+    }
+    std::fs::write(&file, contents).expect("write fixture file");
+    git_ok(dir, &["add", path]);
+    git_ok(
+        dir,
+        &[
+            "-c",
+            "user.name=miscreant",
+            "-c",
+            "user.email=miscreant@example.com",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+    String::from_utf8(git_ok(dir, &["rev-parse", "HEAD"]))
+        .expect("utf-8 commit id")
+        .trim()
+        .to_owned()
+}
+
+/// Build a pack with `git pack-objects --stdout --revs`, feeding one rev
+/// argument per stdin line (prefix a rev with `^` to exclude its closure).
+/// `extra` is appended to the argument list (e.g. `["--thin"]`).
+#[allow(dead_code)]
+pub fn pack_revs(dir: &Path, extra: &[&str], revs: &[&str]) -> Vec<u8> {
+    let mut args = vec!["pack-objects", "-q", "--stdout", "--revs"];
+    args.extend_from_slice(extra);
+    let mut input = revs.join("\n");
+    input.push('\n');
+    git_ok_with_input(dir, &args, input.as_bytes())
+}
+
+/// List every object reachable per `git rev-list --objects <revs>` as
+/// `(oid, kind, body)`, with bodies read via `git cat-file --batch`.
+#[allow(dead_code)]
+pub fn rev_objects(dir: &Path, revs: &[&str]) -> Vec<(ObjectId, Kind, Vec<u8>)> {
+    let mut args = vec!["rev-list", "--objects"];
+    args.extend_from_slice(revs);
+    let listing = String::from_utf8(git_ok(dir, &args)).expect("utf-8 rev-list output");
+    let mut batch_input = String::new();
+    for line in listing.lines() {
+        let oid = line.split_whitespace().next().expect("oid per line");
+        batch_input.push_str(oid);
+        batch_input.push('\n');
+    }
+    let batch = git_ok_with_input(dir, &["cat-file", "--batch"], batch_input.as_bytes());
+    parse_cat_file_batch(&batch)
+}
+
+/// Parse `git cat-file --batch` output: repeated `<oid> <type> <size>\n`
+/// headers, each followed by `<size>` body bytes and a newline.
+fn parse_cat_file_batch(mut bytes: &[u8]) -> Vec<(ObjectId, Kind, Vec<u8>)> {
+    let mut objects = Vec::new();
+    while !bytes.is_empty() {
+        let header_end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("batch header line");
+        let header = std::str::from_utf8(&bytes[..header_end]).expect("utf-8 batch header");
+        let mut fields = header.split(' ');
+        let oid = ObjectId::from_hex(fields.next().expect("batch oid").as_bytes())
+            .expect("valid batch oid");
+        let kind =
+            Kind::from_bytes(fields.next().expect("batch type").as_bytes()).expect("known kind");
+        let size: usize = fields
+            .next()
+            .expect("batch size")
+            .parse()
+            .expect("numeric batch size");
+        let body_start = header_end + 1;
+        let body = bytes[body_start..body_start + size].to_vec();
+        objects.push((oid, kind, body));
+        // Skip the body and the trailing newline that `--batch` appends.
+        bytes = &bytes[body_start + size + 1..];
+    }
+    objects
 }

@@ -8,10 +8,18 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+gix-features = { version = "0.48.1", features = ["progress", "zlib"] }
 gix-hash = { version = "0.25.1", features = ["sha1", "sha256"] }
 gix-object = { version = "0.62.0", features = ["sha1", "sha256"] }
+gix-pack = { version = "0.72.0", default-features = false, features = [
+    "streaming-input",
+    "parallel",
+    "sha1",
+    "sha256",
+] }
 gix-packetline-blocking = "0.19.3"
 slatedb = { version = "0.14.1", features = ["aws"] }
+tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
@@ -20,4 +28,3 @@ url = "2.5"
 
 [dev-dependencies]
 reqwest = "0.13.4"
-tempfile = "3.27.0"
