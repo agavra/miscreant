@@ -96,13 +96,10 @@ enum Flag {
 
 /// A frontier entry: ordered by generation (then oid, purely for
 /// determinism), so the max-heap pops the highest generation first. Parents
-/// have strictly smaller generations than their descendants, which normally
-/// guarantees a HAVE is propagated to a shared ancestor before that ancestor
-/// is popped. That argument is still worth keeping in mind — it is why a
-/// Want→Have downgrade usually beats the pop that would otherwise emit the
-/// same commit — but it is no longer load-bearing for termination safety:
-/// see `Discovery`'s `pending` field for why correctness no longer depends
-/// on it.
+/// have strictly smaller generations than their descendants, so a HAVE
+/// normally propagates to a shared ancestor before that ancestor is popped —
+/// this ordering is what makes discovery prune instead of over-serving.
+/// Termination safety does not depend on it: see `Discovery::pending`.
 #[derive(Debug, PartialEq, Eq)]
 struct QueueEntry {
     generation: u32,
@@ -130,28 +127,13 @@ impl PartialOrd for QueueEntry {
 struct Discovery {
     frontier: BinaryHeap<QueueEntry>,
     state: HashMap<ObjectId, Flag>,
-    /// Commits currently marked WANT that have not yet been resolved, i.e.
-    /// emitted into `to_send` or downgraded to HAVE. This used to be a
-    /// signed counter, charged by one when a commit became WANT and refunded
-    /// by one when it was emitted or downgraded — arithmetically correct on
-    /// healthy data, but its correctness depended
-    /// on the heap's generation ordering, which itself depends on
-    /// commit-graph generations being correct. Generations are *derived*
-    /// data: a stale or corrupt record can invert parent/child ordering so a
-    /// commit is popped and emitted *before* the have-propagation that would
-    /// have downgraded it arrives, and the downgrade still fires afterward —
-    /// a double refund. A counter decrements twice for that one commit's
-    /// single WANT charge, which can drive it to zero while other, unrelated
-    /// wants are still unresolved, ending the loop early and silently
-    /// serving an incomplete pack. A set has no such failure mode: `insert`
-    /// and `remove` are idempotent, so the redundant downgrade after
-    /// emission is a no-op rather than a phantom refund that starves the
-    /// rest of the walk. The worst a corrupt generation can do now is emit a
-    /// commit before its own downgrade is processed — a harmless, if
-    /// pointless, extra pack entry (over-serving) — never lose track of an
-    /// unrelated pending want (under-serving). `pending.len()` equals the
-    /// old counter's value at every step on healthy data, so behavior is
-    /// unchanged there.
+    /// Commits marked WANT that are not yet resolved (emitted into
+    /// `to_send` or downgraded to HAVE); discovery terminates when this
+    /// empties. A set rather than a count because `insert`/`remove` are
+    /// idempotent: corrupt commit-graph generations can reorder the heap so
+    /// a commit is emitted before its downgrade arrives, and the redundant
+    /// removal must be a no-op — the worst case is an extra pack entry
+    /// (over-serving), never a silently incomplete pack.
     pending: HashSet<ObjectId>,
 }
 
@@ -1132,8 +1114,8 @@ mod tests {
         // given: a chain c1 <- c2 <- c3 plus an unrelated root commit d1,
         // with every commit-graph record seeded by hand (root trees and
         // parents accurate; only the generations lie): gen(c2)=10 outranks
-        // the have c3's gen(c3)=5, so c2's want-pop is popped and emitted
-        // before c3's have-propagation ever reaches it.
+        // the have c3's gen(c3)=5, so c2 is popped and emitted before c3's
+        // have-propagation reaches it.
         let w = walker().await;
         let commits = chain(&w, 3).await;
         let (c1, c2, c3) = (commits[0], commits[1], commits[2]);
@@ -1169,13 +1151,11 @@ mod tests {
         // downgraded it arrives; d1 is an unrelated want resolved later.
         let selection = w.select_commits(&[c2, d1], &[c3]).await.expect("select");
 
-        // then: the walk completes rather than under-serving. The old
-        // counter was charged once for c2's want but refunded twice — once
-        // on emission, once on the late downgrade — which would zero it out
-        // after resolving only one of {c1, d1} and silently drop the other,
-        // producing an incomplete pack with no error. The pending set has
-        // no such failure mode (insert/remove are idempotent), so both
-        // survive alongside the over-served c2.
+        // then: the walk completes and every want is served. The late
+        // downgrade of the already-emitted c2 must be a no-op: if it
+        // counted as a second resolution, discovery would stop after
+        // resolving only one of {c1, d1} and silently serve an incomplete
+        // pack. Over-serving c2 is acceptable; dropping a want is not.
         assert_eq!(as_set(&selection.to_send), as_set(&[c2, c1, d1]));
         assert_eq!(selection.common, vec![c3]);
     }
