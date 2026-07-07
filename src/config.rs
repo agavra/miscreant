@@ -1,7 +1,9 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use clap::Parser;
+use url::Url;
 
 /// Server configuration, populated from CLI flags and `MISCREANT_*`
 /// environment variables.
@@ -66,4 +68,112 @@ fn default_bind_addr() -> SocketAddr {
 
 fn default_staging_root() -> PathBuf {
     std::env::temp_dir().join("miscreant-staging")
+}
+
+/// Normalize a storage URL into a form `object_store::parse_url` accepts.
+///
+/// `object_store` only parses the `file` scheme when it has no host and an
+/// absolute path, so a relative `file` URL (e.g. the default
+/// `file://./miscreant-data`, whose host parses as `.`) or a bare relative
+/// path is resolved against the current directory and re-emitted as an
+/// absolute `file:///…` URL. Non-`file` URLs (`memory://`, `s3://…`) pass
+/// through unchanged.
+pub fn normalize_storage_url(raw: &str) -> io::Result<String> {
+    let path_part = if let Some(rest) = raw.strip_prefix("file://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("file:") {
+        rest
+    } else if raw.contains("://") || raw.starts_with("memory:") {
+        return Ok(raw.to_owned());
+    } else {
+        // No scheme at all: treat the whole string as a filesystem path.
+        raw
+    };
+
+    let path = Path::new(path_part);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let cleaned = clean_path(&absolute);
+
+    Url::from_file_path(&cleaned)
+        .map(|url| url.to_string())
+        .map_err(|()| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot build a file url from {}", cleaned.display()),
+            )
+        })
+}
+
+/// Collapse `.` and `..` components so a joined relative path yields a tidy
+/// absolute path (`/cwd/./data` → `/cwd/data`).
+fn clean_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_pass_through_non_file_storage_urls() {
+        // given/when/then
+        assert_eq!(normalize_storage_url("memory://").unwrap(), "memory://");
+        assert_eq!(
+            normalize_storage_url("s3://bucket/prefix").unwrap(),
+            "s3://bucket/prefix"
+        );
+    }
+
+    #[test]
+    fn should_normalize_relative_file_url_to_absolute() {
+        // given
+        let cwd = std::env::current_dir().unwrap();
+        let expected = Url::from_file_path(cwd.join("miscreant-data"))
+            .unwrap()
+            .to_string();
+
+        // when/then: the default host-`.` form and a bare relative path both
+        // resolve to the same absolute `file:///…` URL.
+        assert_eq!(
+            normalize_storage_url("file://./miscreant-data").unwrap(),
+            expected
+        );
+        assert_eq!(normalize_storage_url("miscreant-data").unwrap(), expected);
+    }
+
+    #[test]
+    fn should_preserve_absolute_file_url() {
+        // given
+        let expected = Url::from_file_path("/srv/miscreant").unwrap().to_string();
+
+        // when/then
+        assert_eq!(
+            normalize_storage_url("file:///srv/miscreant").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn should_normalize_the_default_storage_url() {
+        // given/when: the shipped default must be openable.
+        let normalized = normalize_storage_url(&Config::default().storage_url).unwrap();
+
+        // then
+        assert!(normalized.starts_with("file:///"));
+        assert!(normalized.ends_with("/miscreant-data"));
+    }
 }

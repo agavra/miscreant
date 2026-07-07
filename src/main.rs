@@ -22,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
     tracing::info!(addr = %config.bind_addr, "listening");
 
-    let state = AppState::new(config);
+    let state = AppState::new(config)
+        .await
+        .context("failed to open storage")?;
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await

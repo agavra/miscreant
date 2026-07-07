@@ -93,6 +93,10 @@ pub enum StoreError {
     /// The configured storage URL could not be parsed.
     #[error("invalid storage url: {0}")]
     Url(#[from] url::ParseError),
+    /// An I/O error while resolving the storage location (e.g. reading the
+    /// current directory to make a relative `file` URL absolute).
+    #[error("io error resolving storage location: {0}")]
+    Io(#[from] std::io::Error),
     /// The object store could not be resolved from the URL, or an object
     /// store operation failed.
     #[error("object store error: {0}")]

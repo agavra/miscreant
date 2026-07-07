@@ -1144,6 +1144,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-packetline-blocking"
+version = "0.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89c59c3ad41e68cb38547d849e9ef5ccfc0d00f282244ba1441ae856be54d001"
+dependencies = [
+ "bstr",
+ "faster-hex",
+ "gix-trace",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "gix-trace"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1837,6 +1849,7 @@ dependencies = [
  "clap",
  "gix-hash",
  "gix-object",
+ "gix-packetline-blocking",
  "reqwest",
  "slatedb",
  "tempfile",

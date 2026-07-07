@@ -1,12 +1,11 @@
 mod common;
 
-use common::TestServer;
-use miscreant::Config;
+use common::{TestServer, test_config};
 
 #[tokio::test]
 async fn should_return_ok_from_healthz() {
     // given
-    let server = TestServer::spawn(Config::default()).await;
+    let server = TestServer::spawn(test_config()).await;
 
     // when
     let response = reqwest::get(format!("{}/healthz", server.base_url()))
