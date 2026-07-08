@@ -1,15 +1,16 @@
 //! The `git-upload-pack` endpoint: protocol-v2 command dispatch for the fetch
 //! side of the smart-HTTP protocol.
 //!
-//! See `docs/0001-init.md` §Fetch API, §command=ls-refs, and §command=fetch.
-//! A request arrives as a `command=<name>` pkt-line, then capability lines
-//! (`agent`, `object-format`) up to a delimiter packet, then command
-//! arguments up to a flush. The endpoint serves protocol v2 only — a missing
-//! or wrong `Git-Protocol` header is a 400, mirroring the advertisement —
-//! and dispatches on the command name. `ls-refs` and `fetch` are served
-//! here; `object-format` and `object-info` are recognized v2 commands not
-//! yet served and draw an `ERR` pkt-line, as does any unknown command. All
-//! results use the `application/x-git-upload-pack-result` content type.
+//! See `docs/0001-init.md` §Fetch API, §command=ls-refs, §command=fetch,
+//! §command=object-format, and §command=object-info. A request arrives as a
+//! `command=<name>` pkt-line, then capability lines (`agent`,
+//! `object-format`) up to a delimiter packet, then command arguments up to a
+//! flush. The endpoint serves protocol v2 only — a missing or wrong
+//! `Git-Protocol` header is a 400, mirroring the advertisement — and
+//! dispatches on the command name: `ls-refs`, `fetch`, `object-format`, and
+//! `object-info` are all served here; any other command draws an `ERR`
+//! pkt-line. All results use the `application/x-git-upload-pack-result`
+//! content type.
 //!
 //! `fetch` negotiation is single-round: a request without `done` is answered
 //! with an `acknowledgments` section (`ACK` per recognized have, `NAK` when
@@ -104,9 +105,8 @@ pub async fn upload_pack(
     match request.command.as_str() {
         "ls-refs" => ls_refs(state, &meta, &request.args).await,
         "fetch" => fetch(state, &meta, &request.args).await,
-        command @ ("object-format" | "object-info") => {
-            err_line(&format!("unsupported command: {command}"))
-        }
+        "object-format" => object_format(&meta),
+        "object-info" => object_info(state, &meta, &request.args).await,
         command => err_line(&format!("unknown command: {command}")),
     }
 }
@@ -406,6 +406,89 @@ impl FetchArgs {
                     "no-progress" => parsed.no_progress = true,
                     "thin-pack" | "ofs-delta" | "include-tag" => {}
                     other => return Err(format!("unexpected fetch argument: {other}")),
+                }
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+/// Serve the `object-format` command: a single pkt-line carrying the repo's
+/// `object-format` metadata value, terminated by a flush. Real git never
+/// sends this command (`docs/0001-init.md` §command=object-format describes
+/// it as a nonstandard addition); a client that does gets the same value the
+/// `object-format=<x>` capability already advertises.
+fn object_format(meta: &RepoMeta) -> Response {
+    let mut body = Vec::new();
+    let line = format!("{}\n", meta.object_format);
+    if encode::data_to_write(line.as_bytes(), &mut body).is_err()
+        || encode::flush_to_write(&mut body).is_err()
+    {
+        return http::internal_error();
+    }
+    http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body)
+}
+
+/// Serve the `object-info` command: for each requested `oid`, its content
+/// size read via [`ObjectDb::size`] — never the blob store, so an offloaded
+/// blob's size comes from its pointer record, not an object-storage round
+/// trip. The response is a `size` header line followed by one `<oid> <size>`
+/// line per requested oid, in request order, then a flush
+/// (`docs/0001-init.md` §command=object-info). An oid absent from the
+/// repository is an in-band `ERR`, per protocol-v2's server-error convention
+/// for a request the server cannot satisfy.
+async fn object_info(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
+    let parsed = match ObjectInfoArgs::parse(args) {
+        Ok(parsed) => parsed,
+        Err(message) => return err_line(&message),
+    };
+
+    let mut body = Vec::new();
+    if encode::data_to_write(b"size\n", &mut body).is_err() {
+        return http::internal_error();
+    }
+    for oid in &parsed.oids {
+        let size = match state.objectdb.size(meta.id, oid).await {
+            Ok(Some((_, size))) => size,
+            Ok(None) => return err_line(&format!("unknown object {oid}")),
+            Err(err) => return error_response(&err),
+        };
+        let line = format!("{} {size}\n", oid.to_hex());
+        if encode::data_to_write(line.as_bytes(), &mut body).is_err() {
+            return http::internal_error();
+        }
+    }
+    if encode::flush_to_write(&mut body).is_err() {
+        return http::internal_error();
+    }
+    http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body)
+}
+
+/// Parsed `object-info` arguments.
+#[derive(Debug, Default)]
+struct ObjectInfoArgs {
+    /// The client wants size information in the response. Accepted but not
+    /// load-bearing: size is the only attribute this server can report, so
+    /// it is always included regardless of this flag.
+    size: bool,
+    /// The objects to report on, in request order.
+    oids: Vec<ObjectId>,
+}
+
+impl ObjectInfoArgs {
+    /// Parse `object-info` argument lines. An unrecognized argument or an oid
+    /// that fails to parse as hex is returned as the `ERR` reply message.
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut parsed = ObjectInfoArgs::default();
+        for arg in args {
+            if let Some(hex) = arg.strip_prefix("oid ") {
+                let oid = ObjectId::from_hex(hex.as_bytes())
+                    .map_err(|_| format!("invalid oid: {hex}"))?;
+                parsed.oids.push(oid);
+            } else {
+                match arg.as_str() {
+                    "size" => parsed.size = true,
+                    other => return Err(format!("unexpected object-info argument: {other}")),
                 }
             }
         }
@@ -921,5 +1004,40 @@ mod tests {
 
         // then: the packfile section starts immediately
         assert_eq!(prefix, pkt(b"packfile\n"));
+    }
+
+    #[test]
+    fn should_parse_object_info_size_flag_and_oids_in_order() {
+        // given: the size flag and two oid requests
+        let args = vec![
+            "size".to_owned(),
+            format!("oid {}", oid(b'a')),
+            format!("oid {}", oid(b'b')),
+        ];
+
+        // when
+        let parsed = ObjectInfoArgs::parse(&args).expect("parse args");
+
+        // then
+        assert!(parsed.size);
+        assert_eq!(parsed.oids, vec![oid(b'a'), oid(b'b')]);
+    }
+
+    #[test]
+    fn should_reject_an_unknown_object_info_argument() {
+        // given/when
+        let err = ObjectInfoArgs::parse(&["deepen 1".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "unexpected object-info argument: deepen 1");
+    }
+
+    #[test]
+    fn should_reject_a_malformed_object_info_oid() {
+        // given/when
+        let err = ObjectInfoArgs::parse(&["oid not-hex".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "invalid oid: not-hex");
     }
 }

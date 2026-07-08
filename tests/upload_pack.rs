@@ -37,6 +37,29 @@ fn ls_refs_body(args: &[&str]) -> Vec<u8> {
     body
 }
 
+/// Frame an `object-format` command request: the command and the
+/// `object-format` capability, terminated directly by a flush — the command
+/// takes no arguments, so there is no delimiter or argument section.
+fn object_format_body() -> Vec<u8> {
+    let mut body = pkt(b"command=object-format\n");
+    body.extend(pkt(b"object-format=sha1\n"));
+    body.extend_from_slice(FLUSH);
+    body
+}
+
+/// Frame an `object-info` command request: the command, the `object-format`
+/// capability, a delimiter, then one pkt-line per argument, then a flush.
+fn object_info_body(args: &[String]) -> Vec<u8> {
+    let mut body = pkt(b"command=object-info\n");
+    body.extend(pkt(b"object-format=sha1\n"));
+    body.extend_from_slice(DELIM);
+    for arg in args {
+        body.extend(pkt(format!("{arg}\n").as_bytes()));
+    }
+    body.extend_from_slice(FLUSH);
+    body
+}
+
 /// POST a protocol-v2 command request to a repo's upload-pack endpoint.
 async fn post_upload_pack(base_url: &str, repo: &str, body: Vec<u8>) -> reqwest::Response {
     reqwest::Client::new()
@@ -303,21 +326,101 @@ async fn should_reject_upload_pack_without_protocol_v2() {
 }
 
 #[tokio::test]
-async fn should_reject_unsupported_object_info_command() {
+async fn should_return_the_repos_object_format() {
     // given
     let server = TestServer::spawn(test_config()).await;
     server.store().create_repo("proj").await.expect("create");
 
-    // when: a real v2 command the server does not yet serve
-    let mut body = pkt(b"command=object-info\n");
-    body.extend(pkt(b"object-format=sha1\n"));
-    body.extend_from_slice(FLUSH);
-    let response = post_upload_pack(&server.base_url(), "proj", body).await;
+    // when
+    let response = post_upload_pack(&server.base_url(), "proj", object_format_body()).await;
 
-    // then: an ERR pkt-line naming the command as unsupported
+    // then: the body is exactly the sha1 line plus the flush
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    let mut expected = pkt(b"sha1\n");
+    expected.extend_from_slice(FLUSH);
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+// Multi-threaded: the real `git push` subprocess blocks its thread on HTTP
+// the in-process server must answer concurrently.
+#[tokio::test(flavor = "multi_thread")]
+async fn should_report_sizes_for_inline_and_offloaded_blobs_via_object_info() {
+    // given: a repo pushed with a small blob (stored inline) and a blob
+    // larger than the inline threshold (offloaded to the blob store)
+    let server = TestServer::spawn(test_config()).await;
+    let local = server.tempdir().join("local");
+    init_repo(&local);
+    let small = b"small blob content".to_vec();
+    let large = vec![b'x'; 70_000]; // exceeds the 65536-byte inline threshold
+    commit_file(&local, "small.txt", &small, "add small");
+    commit_file(&local, "large.bin", &large, "add large");
+    let url = format!("{}/proj.git", server.base_url());
+    let push = git(&local, &["push", &url, "main:refs/heads/main"]);
+    assert!(
+        push.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let small_oid = rev_parse(&local, "HEAD:small.txt");
+    let large_oid = rev_parse(&local, "HEAD:large.bin");
+
+    // when
+    let args = vec![
+        "size".to_owned(),
+        format!("oid {small_oid}"),
+        format!("oid {large_oid}"),
+    ];
+    let response = post_upload_pack(&server.base_url(), "proj", object_info_body(&args)).await;
+
+    // then: both sizes are reported, the offloaded blob's true content size
+    // included even though its content never lived in SlateDB
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8");
+    assert!(body.contains("size"), "body: {body}");
+    assert!(
+        body.contains(&format!("{small_oid} {}", small.len())),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(&format!("{large_oid} {}", large.len())),
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn should_reject_object_info_for_an_unknown_oid() {
+    // given
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+
+    // when: the requested oid has no object record in the repository
+    let args = vec!["size".to_owned(), format!("oid {}", oid(b'a'))];
+    let response = post_upload_pack(&server.base_url(), "proj", object_info_body(&args)).await;
+
+    // then: an in-band ERR pkt-line, not a hard failure of the RPC itself
+    assert_eq!(response.status(), 200);
     let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8");
     assert!(
-        body.contains("ERR ") && body.contains("unsupported command: object-info"),
+        body.contains("ERR ") && body.contains("unknown object"),
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn should_reject_an_unknown_object_info_argument() {
+    // given
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+
+    // when
+    let args = vec!["deepen 1".to_owned()];
+    let response = post_upload_pack(&server.base_url(), "proj", object_info_body(&args)).await;
+
+    // then
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8");
+    assert!(
+        body.contains("ERR ") && body.contains("unexpected object-info argument: deepen 1"),
         "body: {body}"
     );
 }
