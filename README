@@ -1,0 +1,74 @@
+Miscreant Git Server
+====================
+
+The miscreant git server is an OSS, MIT-licensed git server that is
+backed entirely by object storage. This makes it zero-ops, highly
+scalable for high concurrency/agentic git workloads and a cost
+effective code hosting option.
+
+Quickstart
+----------
+
+[Work in Progress] We are working on building deployable binaries,
+for now you can build Miscreant from source and add it as a git remote
+for your project.
+
+Run the server (requires a Rust toolchain). By default it listens on
+127.0.0.1:8470 and stores all data under ./miscreant-data:
+
+    cargo run
+
+From any repository push to the server. Unknown repositories are created
+on the first push, so there is no setup step:
+
+    git push http://127.0.0.1:8470/miscreant main
+
+Then clone it back from any other directory:
+
+    git clone http://127.0.0.1:8470/miscreant
+
+
+Why Miscreant?
+--------------
+Agents make exceptional use of file systems, and it is increasingly
+clear that having access to a versioned remote file system that can
+handle conflicts amongst multiple agents concurrently access the same
+files is critical.
+
+Miscreant is a low-level implementation of the git HTTP(S) protocol
+that allows for concurrent, transactional access to multiple git
+repositories backed by object storage. Unlike using an existing Git
+hosting solution like GitHub, Miscreant offers no rate limits, UI or
+workflow/action integration. It is designed to be extremely cheap to
+store enormous amounts of data and serve thousands of concurrent
+reqeusts.
+
+Miscreant is not a complete developer product, instead the intention is
+to serve as an infrastructure component of other solutions such as
+remote file systems and sandbox backends.
+
+Architecture Overview
+=====================
+
+Miscreant is a single binary rust server built on [SlateDB](https://slatedb.io)
+that speaks the git HTTPs protocol:
+
+┌───────────┐         ┌───────────┐       ┌S3───────────┐
+│   agent   │────┐    │ Miscreant │█      │┌───────────┐│█
+└───────────┘    │    │  Server   │█      ││  blobs/   ││█
+┌───────────┐    │    │           │█      │└───────────┘│█
+│   agent   │────┼───▶│┌─────────┐│──────▶│┌───────────┐│█
+└───────────┘    │    ││ slatedb ││█      ││ slatedb/  ││█
+┌───────────┐    │    │└─────────┘│█      │└───────────┘│█
+│   human   │────┘    └───────────┘█      └─────────────┘█
+└───────────┘          █████████████       ███████████████
+
+Agents and humans can both concurrently connect to the Miscreant and use it
+to coordinate and resolve conflicts. The data is stored in two locations:
+all git objects (trees, commits, blob IDs) are stored in SlateDB as well
+as any blob content that is under a certain threshold (64KB default) while
+all blobs that exceed this threshold are stored directly in S3. The blobs
+and the slatedb directories are stored within the same S3 bucket.
+
+Note that S3 is a placeholder for any object storage system, we could use
+GCS, R2, Tigris, etc...
