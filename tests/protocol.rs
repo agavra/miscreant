@@ -36,7 +36,10 @@ fn expected_upload_advert() -> Vec<u8> {
 /// The exact expected bytes of the v0 receive-pack advertisement for an empty
 /// repository (the synthetic `capabilities^{}` line).
 fn expected_empty_receive_advert() -> Vec<u8> {
-    let caps = format!("report-status delete-refs ofs-delta {}", agent_capability());
+    let caps = format!(
+        "report-status delete-refs side-band-64k ofs-delta {}",
+        agent_capability()
+    );
     let zeros = "0".repeat(40);
     let cap_line = format!("{zeros} capabilities^{{}}\0{caps}\n");
     let mut expected = Vec::new();

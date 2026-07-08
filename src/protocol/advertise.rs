@@ -50,7 +50,10 @@ pub fn receive_pack(
     refs: &[(String, RefTarget)],
     object_format: Kind,
 ) -> io::Result<()> {
-    let caps = format!("report-status delete-refs ofs-delta agent={}", agent());
+    let caps = format!(
+        "report-status delete-refs side-band-64k ofs-delta agent={}",
+        agent()
+    );
 
     encode::data_to_write(b"# service=git-receive-pack\n", &mut *out)?;
     encode::flush_to_write(&mut *out)?;
