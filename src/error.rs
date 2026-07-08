@@ -19,6 +19,7 @@
 //! into it.
 
 use crate::git::ingest::IngestError;
+use crate::git::pack_out::PackOutError;
 use crate::git::promote::PromoteError;
 use crate::git::walk::WalkError;
 use crate::storage::objectdb::ObjectDbError;
@@ -127,6 +128,21 @@ impl Classify for PromoteError {
             // A SHA-verified object that will not parse is storage/pack
             // corruption, not a client mistake.
             PromoteError::Decode { .. } => Class::Server,
+        }
+    }
+}
+
+impl<E: Classify + std::error::Error> Classify for PackOutError<E> {
+    fn class(&self) -> Class {
+        match self {
+            // The object source (lookups feeding the pack) carries its own
+            // classification.
+            PackOutError::Input(e) => e.class(),
+            // Compression failures, output/hashing failures, and a pack cut
+            // short of its declared object count are all internal faults.
+            PackOutError::Entry { .. }
+            | PackOutError::Write(_)
+            | PackOutError::Truncated { .. } => Class::Server,
         }
     }
 }

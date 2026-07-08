@@ -303,13 +303,13 @@ async fn should_reject_upload_pack_without_protocol_v2() {
 }
 
 #[tokio::test]
-async fn should_reject_unsupported_fetch_command() {
+async fn should_reject_unsupported_object_info_command() {
     // given
     let server = TestServer::spawn(test_config()).await;
     server.store().create_repo("proj").await.expect("create");
 
     // when: a real v2 command the server does not yet serve
-    let mut body = pkt(b"command=fetch\n");
+    let mut body = pkt(b"command=object-info\n");
     body.extend(pkt(b"object-format=sha1\n"));
     body.extend_from_slice(FLUSH);
     let response = post_upload_pack(&server.base_url(), "proj", body).await;
@@ -317,7 +317,7 @@ async fn should_reject_unsupported_fetch_command() {
     // then: an ERR pkt-line naming the command as unsupported
     let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8");
     assert!(
-        body.contains("ERR ") && body.contains("unsupported command: fetch"),
+        body.contains("ERR ") && body.contains("unsupported command: object-info"),
         "body: {body}"
     );
 }

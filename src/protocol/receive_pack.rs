@@ -22,15 +22,11 @@ use gix_packetline_blocking::{Channel, PacketLineRef, decode, encode};
 use crate::AppState;
 use crate::error::{self, Class};
 use crate::git::{ingest_pack, validate_and_promote};
-use crate::protocol::http;
+use crate::protocol::{MAX_BAND_DATA, http};
 use crate::storage::store::{RefOutcome, RefUpdate, RefUpdateResult, RepoMeta};
 
 /// Content type of a receive-pack RPC result.
 const RESULT_CONTENT_TYPE: &str = "application/x-git-receive-pack-result";
-
-/// Largest payload per side-band data packet: the wire limit (65516) minus
-/// the one-byte channel prefix side-band framing prepends.
-const MAX_BAND_DATA: usize = 65515;
 
 /// The reason attached to every ref when the pack itself could not be
 /// processed. It mirrors git's own per-command status in that case, where the

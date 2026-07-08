@@ -46,3 +46,12 @@ Miscreant. See `docs/0001-init.md` for the design.
   post-order traversal. Not a gap — recorded because the ordering places tags
   later than one might expect from the design's "blobs, then trees, then
   commits" summary, which does not mention tags.
+
+## Fetch / upload
+
+- **`include-tag` is accepted and ignored.** The fetch command parses the
+  argument but never auto-includes annotated tag objects whose targets enter
+  the pack; tag objects are sent only when a tag ref itself is wanted. A
+  `git clone` wants every advertised ref (tags included), so clones are
+  unaffected; a bare `git fetch` that relies on tag following may not pick
+  up a new tag until it asks for the tag ref explicitly.

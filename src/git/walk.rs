@@ -447,6 +447,10 @@ impl Walker {
             let (root_tree, parents) = match parsed.get(&top) {
                 Some(entry) => entry.clone(),
                 None => {
+                    // This is where the commit object itself is read from the
+                    // object database (and parsed into its root tree and
+                    // parents); everything else in the backfill consumes
+                    // commit-graph records.
                     let entry = self.parse_commit(&top).await?;
                     parsed.insert(top, entry.clone());
                     entry

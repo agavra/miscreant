@@ -191,10 +191,11 @@ pub(crate) fn wants_v2(headers: &HeaderMap) -> bool {
 }
 
 /// Build a git response with the mandatory `Cache-Control: no-cache` header.
+/// The body may be a buffer or a streaming `axum::body::Body`.
 pub(crate) fn git_response(
     status: StatusCode,
     content_type: &'static str,
-    body: Vec<u8>,
+    body: impl IntoResponse,
 ) -> Response {
     (
         status,

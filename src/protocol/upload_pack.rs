@@ -1,26 +1,41 @@
 //! The `git-upload-pack` endpoint: protocol-v2 command dispatch for the fetch
 //! side of the smart-HTTP protocol.
 //!
-//! See `docs/0001-init.md` §Fetch API and §command=ls-refs. A request arrives
-//! as a `command=<name>` pkt-line, then capability lines (`agent`,
-//! `object-format`) up to a delimiter packet, then command arguments up to a
-//! flush. The endpoint serves protocol v2 only — a missing or wrong
-//! `Git-Protocol` header is a 400, mirroring the advertisement — and dispatches
-//! on the command name. `ls-refs` is served here; `fetch`, `object-format`, and
-//! `object-info` are recognized v2 commands not yet served and draw an `ERR`
-//! pkt-line, as does any unknown command. All results use the
-//! `application/x-git-upload-pack-result` content type.
+//! See `docs/0001-init.md` §Fetch API, §command=ls-refs, and §command=fetch.
+//! A request arrives as a `command=<name>` pkt-line, then capability lines
+//! (`agent`, `object-format`) up to a delimiter packet, then command
+//! arguments up to a flush. The endpoint serves protocol v2 only — a missing
+//! or wrong `Git-Protocol` header is a 400, mirroring the advertisement —
+//! and dispatches on the command name. `ls-refs` and `fetch` are served
+//! here; `object-format` and `object-info` are recognized v2 commands not
+//! yet served and draw an `ERR` pkt-line, as does any unknown command. All
+//! results use the `application/x-git-upload-pack-result` content type.
+//!
+//! `fetch` negotiation is single-round: a request without `done` is answered
+//! with an `acknowledgments` section (`ACK` per recognized have, `NAK` when
+//! there are none) followed by `ready`, a delimiter, and the `packfile`
+//! section in the same response; with `done` the `packfile` section comes
+//! directly. Pack bytes are streamed multiplexed over side-band-64k, never
+//! buffered whole.
 
+use std::convert::Infallible;
+use std::io;
+
+use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use gix_hash::ObjectId;
 use gix_object::{Kind, TagRef};
-use gix_packetline_blocking::{PacketLineRef, decode, encode};
+use gix_packetline_blocking::{Channel, PacketLineRef, decode, encode};
+use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::error::{self, Class, Classify};
-use crate::protocol::{advertise, http};
+use crate::git::pack_out::{PackOutError, write_pack};
+use crate::git::walk::Walker;
+use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
 use crate::storage::values::RefTarget;
 use crate::storage::{ObjectDb, ObjectDbError, RepoMeta, Store, StoreError};
@@ -38,6 +53,17 @@ const MAX_SYMREF_DEPTH: usize = 5;
 /// Upper bound on tag-object indirection when peeling a ref to its final
 /// non-tag object. A chain longer than this leaves the ref unpeeled.
 const MAX_PEEL_DEPTH: usize = 5;
+
+/// Number of object-database lookups kept in flight while feeding the pack
+/// writer. Lookups run concurrently against storage, but their results are
+/// consumed in collected order, so the emitted pack is deterministic.
+const OBJECT_LOOKAHEAD: usize = 32;
+
+/// Capacity, in side-band packets, of the channel between the blocking pack
+/// writer and the HTTP response stream. Each packet carries at most
+/// [`MAX_BAND_DATA`] bytes, so this bounds the response memory held per
+/// in-flight fetch.
+const BODY_CHANNEL_PACKETS: usize = 8;
 
 /// Serve a `POST /<repo>/git-upload-pack` request. `repo` is the already
 /// validated repository name.
@@ -77,7 +103,8 @@ pub async fn upload_pack(
 
     match request.command.as_str() {
         "ls-refs" => ls_refs(state, &meta, &request.args).await,
-        command @ ("fetch" | "object-format" | "object-info") => {
+        "fetch" => fetch(state, &meta, &request.args).await,
+        command @ ("object-format" | "object-info") => {
             err_line(&format!("unsupported command: {command}"))
         }
         command => err_line(&format!("unknown command: {command}")),
@@ -110,6 +137,272 @@ fn error_response<E: Classify + std::error::Error>(err: &E) -> Response {
         Class::Client(reason) => err_line(&reason),
         Class::NotFound => http::plain(StatusCode::NOT_FOUND, "repository not found"),
         Class::Server => http::internal_error(),
+    }
+}
+
+/// Serve the `fetch` command: run commit discovery and object collection
+/// (`docs/0001-init.md` §command=fetch Phases I and II), then stream the
+/// pack (Phase III). Walk failures surface before the response body starts,
+/// as an in-band `ERR` pkt-line through the same classifier `ls-refs` uses;
+/// once streaming has begun, a failure can only be reported on side-band
+/// channel 3.
+async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
+    let parsed = match FetchArgs::parse(args) {
+        Ok(parsed) => parsed,
+        Err(message) => return err_line(&message),
+    };
+    if parsed.wants.is_empty() {
+        return err_line("fetch requires at least one want");
+    }
+
+    let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
+    let selection = match walker.select_commits(&parsed.wants, &parsed.haves).await {
+        Ok(selection) => selection,
+        Err(err) => return error_response(&err),
+    };
+    let collected = match walker.collect(&selection.to_send, &selection.common).await {
+        Ok(collected) => collected,
+        Err(err) => return error_response(&err),
+    };
+    let Ok(count) = u32::try_from(collected.len()) else {
+        return err_line("too many objects for one pack");
+    };
+
+    let prefix = match negotiation_prefix(parsed.done, &selection.common) {
+        Ok(prefix) => prefix,
+        Err(_) => return http::internal_error(),
+    };
+
+    // Look up object contents concurrently (up to OBJECT_LOOKAHEAD in
+    // flight), hand them in collected order to the blocking pack writer,
+    // and stream its side-band packets out as the response body.
+    let (object_tx, object_rx) = mpsc::channel(OBJECT_LOOKAHEAD);
+    tokio::spawn(feed_objects(
+        state.objectdb.clone(),
+        meta.id,
+        collected,
+        object_tx,
+    ));
+
+    let (body_tx, body_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_PACKETS);
+    let object_hash = meta.object_format;
+    let no_progress = parsed.no_progress;
+    tokio::task::spawn_blocking(move || {
+        stream_pack(object_rx, body_tx, count, object_hash, no_progress);
+    });
+
+    let body = Body::from_stream(
+        stream::iter([Ok::<_, Infallible>(Bytes::from(prefix))])
+            .chain(stream::unfold(body_rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (Ok(chunk), rx))
+            })),
+    );
+    http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body)
+}
+
+/// The pkt-lines that precede the pack bytes. Without `done` this is the
+/// `acknowledgments` section — `ACK` per recognized have or a lone `NAK` —
+/// then `ready` (every want resolved, or the request would have failed
+/// already) and a delimiter; either way it ends with the `packfile` section
+/// header.
+fn negotiation_prefix(done: bool, common: &[ObjectId]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if !done {
+        encode::data_to_write(b"acknowledgments\n", &mut out)?;
+        if common.is_empty() {
+            encode::data_to_write(b"NAK\n", &mut out)?;
+        } else {
+            for oid in common {
+                encode::data_to_write(format!("ACK {}\n", oid.to_hex()).as_bytes(), &mut out)?;
+            }
+        }
+        encode::data_to_write(b"ready\n", &mut out)?;
+        encode::delim_to_write(&mut out)?;
+    }
+    encode::data_to_write(b"packfile\n", &mut out)?;
+    Ok(out)
+}
+
+/// Read each collected object's kind and body from the object database with
+/// up to [`OBJECT_LOOKAHEAD`] lookups in flight, forwarding results to the
+/// pack writer in collected order. Stops at the first failure (forwarded so
+/// the writer can report it) or when the writer hangs up.
+async fn feed_objects(
+    objectdb: ObjectDb,
+    repo: RepoId,
+    oids: Vec<ObjectId>,
+    tx: mpsc::Sender<Result<(ObjectId, Kind, Bytes), FetchObjectError>>,
+) {
+    let mut lookups = stream::iter(oids)
+        .map(|oid| {
+            let objectdb = objectdb.clone();
+            async move { (oid, objectdb.get(repo, &oid).await) }
+        })
+        .buffered(OBJECT_LOOKAHEAD);
+    while let Some((oid, result)) = lookups.next().await {
+        let item = match result {
+            Ok(Some((kind, body))) => Ok((oid, kind, body)),
+            Ok(None) => Err(FetchObjectError::Missing(oid)),
+            Err(err) => Err(FetchObjectError::Objects(err)),
+        };
+        let stop = item.is_err();
+        if tx.send(item).await.is_err() || stop {
+            return;
+        }
+    }
+}
+
+/// The blocking half of the fetch response: pull looked-up objects from
+/// `objects`, compress them into pack entries, and send the pack multiplexed
+/// as side-band channel-1 packets on `body`, with progress on channel 2
+/// (unless suppressed) and a flush pkt closing a successful response. A
+/// failure after streaming has begun is reported on channel 3 — the only
+/// remaining path to the client — except when the client itself hung up.
+fn stream_pack(
+    mut objects: mpsc::Receiver<Result<(ObjectId, Kind, Bytes), FetchObjectError>>,
+    body: mpsc::Sender<Bytes>,
+    count: u32,
+    object_hash: gix_hash::Kind,
+    no_progress: bool,
+) {
+    if !no_progress {
+        let line = format!("packing {count} objects\n");
+        let _ = send_band(&body, Channel::Progress, line.as_bytes());
+    }
+
+    let mut writer = BandWriter {
+        tx: body.clone(),
+        buf: Vec::new(),
+    };
+    let input = std::iter::from_fn(|| objects.blocking_recv());
+    match write_pack(input, count, object_hash, &mut writer) {
+        Ok(_) => {
+            if !no_progress {
+                let line = format!("packed {count} objects\n");
+                let _ = send_band(&body, Channel::Progress, line.as_bytes());
+            }
+            let mut flush = Vec::new();
+            if encode::flush_to_write(&mut flush).is_ok() {
+                let _ = body.blocking_send(Bytes::from(flush));
+            }
+        }
+        Err(err) => {
+            // A hung-up client is not a fault and has no one left to tell.
+            if let PackOutError::Write(gix_hash::io::Error::Io(io_err)) = &err
+                && io_err.kind() == io::ErrorKind::BrokenPipe
+            {
+                return;
+            }
+            let reason = match error::classify(&err) {
+                Class::Client(reason) => reason,
+                Class::NotFound | Class::Server => "internal error".to_owned(),
+            };
+            let _ = send_band(&body, Channel::Error, reason.as_bytes());
+        }
+    }
+}
+
+/// Encode one side-band packet on `channel` and send it to the response
+/// body. A closed channel (the client went away) surfaces as `BrokenPipe`.
+fn send_band(tx: &mpsc::Sender<Bytes>, channel: Channel, data: &[u8]) -> io::Result<()> {
+    let mut packet = Vec::with_capacity(data.len() + 5);
+    encode::band_to_write(channel, data, &mut packet)?;
+    tx.blocking_send(Bytes::from(packet))
+        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+}
+
+/// An `io::Write` that frames written bytes into side-band-64k channel-1
+/// (pack data) packets, sending each completed packet to the HTTP response
+/// channel. Bytes accumulate until a full packet is available; `flush` sends
+/// any partial remainder.
+struct BandWriter {
+    tx: mpsc::Sender<Bytes>,
+    buf: Vec<u8>,
+}
+
+impl io::Write for BandWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while self.buf.len() >= MAX_BAND_DATA {
+            let rest = self.buf.split_off(MAX_BAND_DATA);
+            let full = std::mem::replace(&mut self.buf, rest);
+            send_band(&self.tx, Channel::Data, &full)?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let data = std::mem::take(&mut self.buf);
+            send_band(&self.tx, Channel::Data, &data)?;
+        }
+        Ok(())
+    }
+}
+
+/// A failure while looking up a collected object for packing.
+#[derive(Debug, thiserror::Error)]
+enum FetchObjectError {
+    /// The object database read failed.
+    #[error(transparent)]
+    Objects(#[from] ObjectDbError),
+    /// A collected object has no record. The walk selected it from live
+    /// state moments earlier, so absence indicates storage corruption.
+    #[error("object {0} is missing from storage")]
+    Missing(ObjectId),
+}
+
+impl Classify for FetchObjectError {
+    fn class(&self) -> Class {
+        match self {
+            FetchObjectError::Objects(e) => e.class(),
+            FetchObjectError::Missing(_) => Class::Server,
+        }
+    }
+}
+
+/// Parsed `fetch` arguments.
+#[derive(Debug, Default)]
+struct FetchArgs {
+    /// The objects the client asks for (tips it saw advertised).
+    wants: Vec<ObjectId>,
+    /// Commits the client claims to already have.
+    haves: Vec<ObjectId>,
+    /// The client is done negotiating and wants the pack immediately.
+    done: bool,
+    /// Suppress side-band progress messages.
+    no_progress: bool,
+}
+
+impl FetchArgs {
+    /// Parse `fetch` argument lines. `thin-pack`, `ofs-delta`, and
+    /// `include-tag` are accepted and ignored: the server only sends full
+    /// (non-delta) entries, which every client accepts, and tag objects are
+    /// sent only for explicitly wanted tag refs. A `filter` argument or any
+    /// unrecognized argument is rejected with the returned `ERR` message.
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut parsed = FetchArgs::default();
+        for arg in args {
+            if let Some(hex) = arg.strip_prefix("want ") {
+                let oid = ObjectId::from_hex(hex.as_bytes())
+                    .map_err(|_| format!("invalid want: {hex}"))?;
+                parsed.wants.push(oid);
+            } else if let Some(hex) = arg.strip_prefix("have ") {
+                let oid = ObjectId::from_hex(hex.as_bytes())
+                    .map_err(|_| format!("invalid have: {hex}"))?;
+                parsed.haves.push(oid);
+            } else if arg == "filter" || arg.starts_with("filter ") {
+                return Err("unsupported filter".to_owned());
+            } else {
+                match arg.as_str() {
+                    "done" => parsed.done = true,
+                    "no-progress" => parsed.no_progress = true,
+                    "thin-pack" | "ofs-delta" | "include-tag" => {}
+                    other => return Err(format!("unexpected fetch argument: {other}")),
+                }
+            }
+        }
+        Ok(parsed)
     }
 }
 
@@ -506,5 +799,102 @@ mod tests {
         let args = ["deepen 1".to_owned()];
         let err = LsRefsArgs::parse(&args).unwrap_err();
         assert_eq!(err, "deepen 1");
+    }
+
+    /// A distinct SHA-1 object id built from a single hex nibble.
+    fn oid(nibble: u8) -> ObjectId {
+        ObjectId::from_hex(&[nibble; 40]).expect("valid sha1 hex")
+    }
+
+    #[test]
+    fn should_parse_fetch_wants_haves_and_flags() {
+        // given: the argument mix a real client sends mid-negotiation
+        let args = vec![
+            format!("want {}", oid(b'a')),
+            format!("want {}", oid(b'b')),
+            "thin-pack".to_owned(),
+            "ofs-delta".to_owned(),
+            "include-tag".to_owned(),
+            "no-progress".to_owned(),
+            format!("have {}", oid(b'c')),
+            "done".to_owned(),
+        ];
+
+        // when
+        let parsed = FetchArgs::parse(&args).expect("parse args");
+
+        // then: wants/haves keep order; ignored args set no flags
+        assert_eq!(parsed.wants, vec![oid(b'a'), oid(b'b')]);
+        assert_eq!(parsed.haves, vec![oid(b'c')]);
+        assert!(parsed.done);
+        assert!(parsed.no_progress);
+    }
+
+    #[test]
+    fn should_reject_a_fetch_filter_argument() {
+        // given/when
+        let err = FetchArgs::parse(&["filter blob:none".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "unsupported filter");
+    }
+
+    #[test]
+    fn should_reject_an_unknown_fetch_argument() {
+        // given/when
+        let err = FetchArgs::parse(&["deepen 1".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "unexpected fetch argument: deepen 1");
+    }
+
+    #[test]
+    fn should_reject_a_malformed_want_oid() {
+        // given/when
+        let err = FetchArgs::parse(&["want not-hex".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "invalid want: not-hex");
+    }
+
+    #[test]
+    fn should_open_with_acknowledgments_and_ready_when_not_done() {
+        // given: one recognized have
+        let common = vec![oid(b'd')];
+
+        // when
+        let prefix = negotiation_prefix(false, &common).expect("build prefix");
+
+        // then: acknowledgments, the ACK, ready, a delimiter, then the
+        // packfile section header
+        let mut expected = pkt(b"acknowledgments\n");
+        expected.extend(pkt(format!("ACK {}\n", oid(b'd')).as_bytes()));
+        expected.extend(pkt(b"ready\n"));
+        expected.extend_from_slice(b"0001");
+        expected.extend(pkt(b"packfile\n"));
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn should_nak_when_no_haves_are_recognized() {
+        // given/when
+        let prefix = negotiation_prefix(false, &[]).expect("build prefix");
+
+        // then: a lone NAK stands in for the missing ACKs
+        let mut expected = pkt(b"acknowledgments\n");
+        expected.extend(pkt(b"NAK\n"));
+        expected.extend(pkt(b"ready\n"));
+        expected.extend_from_slice(b"0001");
+        expected.extend(pkt(b"packfile\n"));
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn should_skip_acknowledgments_after_done() {
+        // given/when: the client already said done
+        let prefix = negotiation_prefix(true, &[oid(b'e')]).expect("build prefix");
+
+        // then: the packfile section starts immediately
+        assert_eq!(prefix, pkt(b"packfile\n"));
     }
 }

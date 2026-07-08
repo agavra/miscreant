@@ -8,12 +8,14 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+futures = "0.3"
 gix-features = { version = "0.48.1", features = ["progress", "zlib"] }
 gix-hash = { version = "0.25.1", features = ["sha1", "sha256"] }
 gix-object = { version = "0.62.0", features = ["sha1", "sha256"] }
 gix-pack = { version = "0.72.0", default-features = false, features = [
     "streaming-input",
     "parallel",
+    "generate",
     "sha1",
     "sha256",
 ] }
