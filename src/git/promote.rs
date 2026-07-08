@@ -139,21 +139,28 @@ pub async fn validate_and_promote(
     // last because a tag may point at a commit promoted in this same batch;
     // writing it earlier could leave committed storage holding a tag whose
     // target is absent if the server died mid-promotion.
+    //
+    // Writes are relaxed-durability: each `put` returns once the record
+    // lands in SlateDB's in-memory WAL buffer, without waiting for the WAL
+    // flush that makes it durable. The flush barrier at the end of this
+    // function (see its comment) is what makes the batch as a whole safe.
     let mut promotion = Promotion::default();
     for (oid, body) in blobs {
-        objectdb.put(repo, &oid, Kind::Blob, body).await?;
+        objectdb.put_relaxed(repo, &oid, Kind::Blob, body).await?;
         promotion.promoted.push(oid);
     }
     for (oid, body) in trees {
-        objectdb.put(repo, &oid, Kind::Tree, body).await?;
+        objectdb.put_relaxed(repo, &oid, Kind::Tree, body).await?;
         promotion.promoted.push(oid);
     }
     for (oid, body) in &commits {
-        objectdb.put(repo, oid, Kind::Commit, body.clone()).await?;
+        objectdb
+            .put_relaxed(repo, oid, Kind::Commit, body.clone())
+            .await?;
         promotion.promoted.push(*oid);
     }
     for (oid, body) in tags {
-        objectdb.put(repo, &oid, Kind::Tag, body).await?;
+        objectdb.put_relaxed(repo, &oid, Kind::Tag, body).await?;
         promotion.promoted.push(oid);
     }
 
@@ -181,9 +188,24 @@ pub async fn validate_and_promote(
             root_tree,
             parents,
         };
-        store.put_commit_graph(repo, oid, &record).await?;
+        store.put_commit_graph_relaxed(repo, oid, &record).await?;
         promotion.commits.push(*oid);
     }
+
+    // Barrier: flush the WAL so every relaxed write issued above is durable
+    // before this function returns, and any write failure surfaces in this
+    // push request rather than a later, unrelated one.
+    //
+    // This is safe because SlateDB writes become durable in submission
+    // order: the WAL is flushed by a single sequential task and replayed
+    // strictly in contiguous wal-id order, each WAL SST landing via one
+    // atomic object-store PUT. This function submits children before
+    // parents (blobs, then trees, then commits, then tags — see Phase 2
+    // above), so any durable prefix of the WAL is a set of full closures;
+    // and the ref CAS that follows promotion (a separate, awaited-durable
+    // transaction) is the last write in the sequence, so a recovered state
+    // that contains a ref necessarily contains that ref's entire closure.
+    store.flush().await?;
 
     Ok(promotion)
 }

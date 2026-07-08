@@ -418,6 +418,11 @@ impl Walker {
     /// for `id` and every ancestor that lacks one. Iterative post-order over
     /// an explicit stack — a commit is resolved only after all its parents
     /// are, so each record's generation is `1 + max(parent generations)`.
+    ///
+    /// Persisted with relaxed durability and no flush barrier: a
+    /// commit-graph record is derived, rebuildable data, so losing one to a
+    /// crash before its WAL write is flushed only means a future call
+    /// recomputes it from the commit objects, which are already durable.
     async fn backfill_commit_info(&self, id: &oid) -> Result<CommitGraphRecord, WalkError> {
         let target = id.to_owned();
         // Parsed commit bodies awaiting their parents' generations.
@@ -465,7 +470,7 @@ impl Walker {
                     parents,
                 };
                 self.store
-                    .put_commit_graph(self.repo, &top, &record)
+                    .put_commit_graph_relaxed(self.repo, &top, &record)
                     .await?;
                 generations.insert(top, generation);
                 if top == target {

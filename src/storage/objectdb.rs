@@ -56,7 +56,8 @@ impl ObjectDb {
     }
 
     /// Store `body` (the object's content, with no git header) as `oid` of
-    /// kind `kind`. A no-op if `oid` already has a record. Callers are
+    /// kind `kind`, waiting for the record write to become durable before
+    /// returning. A no-op if `oid` already has a record. Callers are
     /// responsible for `oid` being the hash of the canonical encoding of
     /// `kind`/`body`.
     pub async fn put(
@@ -65,6 +66,32 @@ impl ObjectDb {
         oid: &oid,
         kind: Kind,
         body: Bytes,
+    ) -> Result<(), ObjectDbError> {
+        self.put_with(repo, oid, kind, body, false).await
+    }
+
+    /// Like [`ObjectDb::put`], but the object record write does not wait
+    /// for durability. An offloaded blob's content still finishes uploading
+    /// to the blob store (awaited here) before the record referencing it is
+    /// submitted, regardless of durability mode — only the SlateDB record
+    /// write itself is relaxed.
+    pub async fn put_relaxed(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        kind: Kind,
+        body: Bytes,
+    ) -> Result<(), ObjectDbError> {
+        self.put_with(repo, oid, kind, body, true).await
+    }
+
+    async fn put_with(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        kind: Kind,
+        body: Bytes,
+        relaxed: bool,
     ) -> Result<(), ObjectDbError> {
         if self.store.object_exists(repo, oid).await? {
             return Ok(());
@@ -83,7 +110,11 @@ impl ObjectDb {
             Kind::Tag => ObjectRecord::Tag(body),
         };
 
-        self.store.put_object(repo, oid, &record).await?;
+        if relaxed {
+            self.store.put_object_relaxed(repo, oid, &record).await?;
+        } else {
+            self.store.put_object(repo, oid, &record).await?;
+        }
         Ok(())
     }
 

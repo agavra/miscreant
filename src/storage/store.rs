@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use gix_hash::{Kind, ObjectId, oid};
+use slatedb::config::{PutOptions, WriteOptions};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::prefix::PrefixStore;
 use slatedb::object_store::{self, ObjectStore};
@@ -175,6 +176,26 @@ pub enum RefOutcome {
     Rejected(String),
 }
 
+/// Durability requested for a single SlateDB write. `Durable` blocks the
+/// write until SlateDB's WAL flush task has persisted it (the default for
+/// every write except promotion and commit-graph backfill); `Relaxed`
+/// returns as soon as the write lands in the in-memory WAL buffer, leaving
+/// durability to a later [`Store::flush`] call or another durable write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    Durable,
+    Relaxed,
+}
+
+impl Durability {
+    fn write_options(self) -> WriteOptions {
+        WriteOptions {
+            await_durable: matches!(self, Durability::Durable),
+            ..WriteOptions::default()
+        }
+    }
+}
+
 /// Typed persistence over SlateDB plus the repository registry. Cheaply
 /// cloneable (shared handles behind `Arc`).
 #[derive(Clone)]
@@ -208,6 +229,14 @@ impl Store {
     /// Flush and cleanly shut down the underlying SlateDB instance.
     pub async fn close(&self) -> Result<(), StoreError> {
         self.db.close().await?;
+        Ok(())
+    }
+
+    /// Block until every write submitted so far — durable or relaxed — is
+    /// durably persisted, by flushing SlateDB's WAL. The barrier a caller
+    /// needs after a batch of `_relaxed` writes.
+    pub async fn flush(&self) -> Result<(), StoreError> {
+        self.db.flush().await?;
         Ok(())
     }
 
@@ -355,15 +384,44 @@ impl Store {
         }
     }
 
-    /// Write an object record.
+    /// Write an object record, waiting for it to become durable before
+    /// returning.
     pub async fn put_object(
         &self,
         repo: RepoId,
         oid: &oid,
         record: &ObjectRecord,
     ) -> Result<(), StoreError> {
+        self.put_object_with(repo, oid, record, Durability::Durable)
+            .await
+    }
+
+    /// Write an object record without waiting for durability; see
+    /// [`Durability::Relaxed`].
+    pub async fn put_object_relaxed(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        record: &ObjectRecord,
+    ) -> Result<(), StoreError> {
+        self.put_object_with(repo, oid, record, Durability::Relaxed)
+            .await
+    }
+
+    async fn put_object_with(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        record: &ObjectRecord,
+        durability: Durability,
+    ) -> Result<(), StoreError> {
         self.db
-            .put(keys::object_key(repo, oid), record.encode())
+            .put_with_options(
+                keys::object_key(repo, oid),
+                record.encode(),
+                &PutOptions::default(),
+                &durability.write_options(),
+            )
             .await?;
         Ok(())
     }
@@ -506,15 +564,44 @@ impl Store {
         }
     }
 
-    /// Write a commit-graph record.
+    /// Write a commit-graph record, waiting for it to become durable before
+    /// returning.
     pub async fn put_commit_graph(
         &self,
         repo: RepoId,
         oid: &oid,
         record: &CommitGraphRecord,
     ) -> Result<(), StoreError> {
+        self.put_commit_graph_with(repo, oid, record, Durability::Durable)
+            .await
+    }
+
+    /// Write a commit-graph record without waiting for durability; see
+    /// [`Durability::Relaxed`].
+    pub async fn put_commit_graph_relaxed(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        record: &CommitGraphRecord,
+    ) -> Result<(), StoreError> {
+        self.put_commit_graph_with(repo, oid, record, Durability::Relaxed)
+            .await
+    }
+
+    async fn put_commit_graph_with(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+        record: &CommitGraphRecord,
+        durability: Durability,
+    ) -> Result<(), StoreError> {
         self.db
-            .put(keys::commit_key(repo, oid), record.encode())
+            .put_with_options(
+                keys::commit_key(repo, oid),
+                record.encode(),
+                &PutOptions::default(),
+                &durability.write_options(),
+            )
             .await?;
         Ok(())
     }

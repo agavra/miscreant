@@ -26,6 +26,14 @@ async fn memory_backend(repo_name: &str) -> (Store, ObjectDb, RepoMeta) {
     (store, objectdb, meta)
 }
 
+/// An `ObjectDb` façade over an already-open `Store`, backed by its own
+/// fresh in-memory blob store (no fixture in these tests offloads a blob,
+/// so blob-store identity across a reopen is irrelevant).
+fn object_db_over(store: &Store) -> ObjectDb {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    ObjectDb::new(store.clone(), BlobStore::new(backing), 65536)
+}
+
 /// A scratch area holding a fixture repository and a staging root.
 struct Fixture {
     _scratch: TempDir,
@@ -373,4 +381,65 @@ async fn should_offload_a_blob_larger_than_the_inline_threshold() {
         .expect("present");
     assert_eq!(kind, Kind::Blob);
     assert_eq!(body, Bytes::from(big));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_read_promoted_objects_and_graph_records_after_reopening_the_store() {
+    // given: a fixture commit and its pack, promoted into a fresh
+    // file://-backed store (relaxed writes only become durable through
+    // promotion's flush barrier, so this exercises that barrier for real —
+    // memory:// has no persistence to lose in the first place)
+    let fx = fixture();
+    let head = commit_file(&fx.repo_dir, "f.txt", b"durable\n", "add f");
+    let pack = pack_revs(&fx.repo_dir, &[], &[&head]);
+    let expected = rev_objects(&fx.repo_dir, &[&head]);
+
+    let store_dir = TempDir::new().expect("create store dir");
+    let store_url = format!("file://{}", store_dir.path().display());
+    let store = Store::open(&store_url).await.expect("open store");
+    let meta = store.create_repo("promote/reopen").await.expect("create");
+    let db = object_db_over(&store);
+
+    // when: the pack is promoted and the store is cleanly closed
+    let staged = ingest_pack(Cursor::new(pack), &db, &meta, &fx.staging)
+        .await
+        .expect("ingest pack");
+    let promotion = validate_and_promote(&staged, &[oid_of(&head)], &db, &store, meta.id)
+        .await
+        .expect("promote pack");
+    store.close().await.expect("close store");
+
+    // when: the store is reopened from the same location with fresh handles
+    let reopened = Store::open(&store_url).await.expect("reopen store");
+    let reopened_db = object_db_over(&reopened);
+
+    // then: every promoted object is readable through the reopened handles
+    for (oid, kind, body) in &expected {
+        let (read_kind, read_body) = reopened_db
+            .get(meta.id, oid)
+            .await
+            .expect("get")
+            .expect("present after reopen");
+        assert_eq!(read_kind, *kind);
+        assert_eq!(read_body, Bytes::from(body.clone()));
+    }
+
+    // then: the commit-graph record promotion wrote also survived the reopen
+    assert_eq!(promotion.commits, vec![oid_of(&head)]);
+    assert_eq!(
+        reopened
+            .get_commit_graph(meta.id, &oid_of(&head))
+            .await
+            .expect("get graph")
+            .expect("present after reopen")
+            .generation,
+        1
+    );
+
+    // A backfilled commit-graph record is derived data written with no
+    // flush barrier (see `backfill_commit_info`): recomputing it after a
+    // wipe, rather than surviving a reopen, is what makes it safe to lose.
+    // `should_backfill_a_missing_middle_graph_record` in walk.rs already
+    // covers that recomputation; there is nothing durability-specific left
+    // to assert about backfilled records here.
 }
