@@ -115,6 +115,25 @@ is about trading serial depth for width and avoiding repeated identical work.
   "conflicts" means CAS-contention throughput and retry-loop convergence, not
   server-side merging.
 
+- **Bulk commit-graph rebuild should scan the object segment, not walk the
+  graph.** `rebuild-graph` chases parent pointers one point-lookup at a time
+  — inherently serial for linear history (N commits × storage RTT; hours at
+  linux scale on cold S3), and frontier batching cannot help a linear chain.
+  A rebuild does not need reachability-ordered discovery: stream the object
+  segment with an LSM prefix scan (sequential reads — the one access pattern
+  object storage serves at full bandwidth), filter to commits, build the DAG
+  and generations in memory, batch-write relaxed. Generations are intrinsic
+  to a commit, so recording unreachable commits alongside reachable ones is
+  harmless.
+
+- **No-delta object storage amplifies stored bytes ~10x on large repos.**
+  Objects are stored as individual zlib streams, so near-identical
+  consecutive trees that a packfile would delta-chain are each stored
+  full-size (linux: ~5GB packed becomes roughly 40–60GB stored). Bytes are
+  cheap, but the amplification multiplies scan volume and block-cache
+  pressure on every bulk read path. Tree deltification or packfile-shaped
+  storage is the eventual fix.
+
 ## Benchmarking
 
 - **Bench harness with agent-shaped workloads.** The SlateDB dogfood repo
