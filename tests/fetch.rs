@@ -152,6 +152,54 @@ fn parse_missing(output: &[u8]) -> (HashSet<String>, HashSet<String>) {
     (present, missing)
 }
 
+/// Pull the raw pack bytes out of a fetch response: the side-band channel-1
+/// payload of every packet after the `packfile` section header (channels 2
+/// and 3 carry progress and errors and are dropped).
+fn extract_pack(pkts: &[Pkt]) -> Vec<u8> {
+    let mut pack = Vec::new();
+    let mut in_packfile = false;
+    for p in pkts {
+        match p {
+            Pkt::Data(data) if data.as_slice() == b"packfile\n" => in_packfile = true,
+            Pkt::Data(data) if in_packfile && data.first() == Some(&1) => {
+                pack.extend_from_slice(&data[1..]);
+            }
+            _ => {}
+        }
+    }
+    pack
+}
+
+/// The object count a pack's v2 header declares (bytes 8..12, big-endian).
+fn pack_object_count(pack: &[u8]) -> u32 {
+    assert!(pack.starts_with(b"PACK"), "not a pack: {:?}", pack.get(..4));
+    u32::from_be_bytes(pack[8..12].try_into().expect("pack count field"))
+}
+
+/// Unpack `pack` into a fresh repository under the server's tempdir and return
+/// the hex ids of the objects it contained. `unpack-objects` performs no
+/// connectivity check, so a pack whose objects reference absent ones (a bare
+/// tree want, or a filtered-out sibling blob) unpacks fine.
+fn unpack_oids(server: &TestServer, pack: &[u8], name: &str) -> HashSet<String> {
+    let dir = server.tempdir().join(name);
+    init_repo(&dir);
+    common::git_ok_with_input(&dir, &["unpack-objects", "-q"], pack);
+    let listing = git_ok(
+        &dir,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    );
+    String::from_utf8(listing)
+        .expect("utf-8 object listing")
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 // The `git` subprocess blocks its thread on HTTP the in-process server must
 // answer concurrently, so the CLI-driven tests use a multi-threaded runtime.
 
@@ -438,4 +486,171 @@ async fn should_clone_with_blob_limit_filter_and_include_only_small_blobs() {
     assert!(!missing.contains(&small_oid), "small blob not missing");
     assert!(missing.contains(&big_oid), "big blob missing: {missing:?}");
     assert!(!present.contains(&big_oid), "big blob not present");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_pack_exactly_the_two_blob_wants_by_arbitrary_oid() {
+    // given: two commits, so history holds two distinct blobs
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+    let blob_a = rev_parse(&local, "HEAD:a.txt");
+    let blob_b = rev_parse(&local, "HEAD:b.txt");
+
+    // when: a fetch that wants the two blobs by oid and is done — no commit
+    // wants, so commit discovery and collection are skipped and the pack is
+    // exactly the wanted objects (git's promisor backfill shape)
+    let body = fetch_body(&[&format!("want {blob_a}"), &format!("want {blob_b}"), "done"]);
+    let response = post_upload_pack(&server.base_url(), "proj", body).await;
+
+    // then: the pack holds precisely those two blobs
+    assert_eq!(response.status(), 200);
+    let pkts = parse_pkts(&response.bytes().await.expect("body"));
+    let pack = extract_pack(&pkts);
+    assert_eq!(pack_object_count(&pack), 2);
+    assert_eq!(
+        unpack_oids(&server, &pack, "unpack-blobs"),
+        HashSet::from([blob_a, blob_b])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_serve_a_bare_tree_want_by_arbitrary_oid() {
+    // given: a pushed commit with a root tree
+    let server = TestServer::spawn(test_config()).await;
+    let (local, _url) = push_fixture(&server, "proj");
+    let root_tree = rev_parse(&local, "HEAD^{tree}");
+
+    // when: a fetch that wants only that tree by oid
+    let body = fetch_body(&[&format!("want {root_tree}"), "done"]);
+    let response = post_upload_pack(&server.base_url(), "proj", body).await;
+
+    // then: the pack holds precisely the tree object, unpackable on its own
+    // even though its blob referent is absent
+    assert_eq!(response.status(), 200);
+    let pkts = parse_pkts(&response.bytes().await.expect("body"));
+    let pack = extract_pack(&pkts);
+    assert_eq!(pack_object_count(&pack), 1);
+    let dir = server.tempdir().join("unpack-tree");
+    assert_eq!(
+        unpack_oids(&server, &pack, "unpack-tree"),
+        HashSet::from([root_tree.clone()])
+    );
+    let kind = git_ok(&dir, &["cat-file", "-t", &root_tree]);
+    assert_eq!(String::from_utf8(kind).expect("utf-8 type").trim(), "tree");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_pack_an_explicitly_wanted_blob_even_under_a_blob_none_filter() {
+    // given: a single commit whose root tree holds two blobs
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+    let commit = rev_parse(&local, "HEAD");
+    let root_tree = rev_parse(&local, "HEAD^{tree}");
+    let wanted_blob = rev_parse(&local, "HEAD:a.txt");
+    let filtered_blob = rev_parse(&local, "HEAD:b.txt");
+
+    // when: git's checkout-triggered backfill shape — a commit want, an
+    // explicit blob want, and `filter blob:none` in the same request (real
+    // git sends exactly this, per GIT_TRACE_PACKET of a partial-clone
+    // checkout)
+    let body = fetch_body(&[
+        &format!("want {commit}"),
+        &format!("want {wanted_blob}"),
+        "filter blob:none",
+        "done",
+    ]);
+    let response = post_upload_pack(&server.base_url(), "proj", body).await;
+
+    // then: the filter drops the traversal-discovered blob but never the
+    // explicitly requested one; the commit and its tree ride along
+    assert_eq!(response.status(), 200);
+    let pkts = parse_pkts(&response.bytes().await.expect("body"));
+    let oids = unpack_oids(&server, &extract_pack(&pkts), "unpack-mixed");
+    assert!(oids.contains(&commit), "commit packed: {oids:?}");
+    assert!(oids.contains(&root_tree), "root tree packed: {oids:?}");
+    assert!(
+        oids.contains(&wanted_blob),
+        "explicit blob packed despite the filter: {oids:?}"
+    );
+    assert!(
+        !oids.contains(&filtered_blob),
+        "traversal-discovered blob filtered out: {oids:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_clone_with_blob_none_filter_and_check_out_the_working_tree() {
+    // given: history that changes a file across commits
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    commit_file(&local, "a.txt", b"alpha v2\n", "modify a");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a partial clone WITH checkout — checkout triggers a promisor
+    // backfill of the tip's blobs by arbitrary oid
+    let clone_dir = clone_repo_with(&server, &url, "clone", &["--filter=blob:none"]);
+
+    // then: the working tree is materialized with the tip's contents and the
+    // partial clone is self-consistent
+    assert_fsck_clean(&clone_dir);
+    assert_eq!(
+        std::fs::read(clone_dir.join("a.txt")).expect("read a.txt"),
+        b"alpha v2\n"
+    );
+    assert_eq!(
+        std::fs::read(clone_dir.join("b.txt")).expect("read b.txt"),
+        b"beta\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_fault_in_historical_blobs_when_diffing_with_log_p() {
+    // given: a partial clone of a file that changed across two commits
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    commit_file(&local, "a.txt", b"alpha v2\n", "modify a");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+    let clone_dir = clone_repo_with(&server, &url, "clone", &["--filter=blob:none"]);
+
+    // when: `log -p` diffs each commit against its parent, faulting in the
+    // older blob version on demand (git_ok asserts the exit status is 0)
+    let text = String::from_utf8(git_ok(&clone_dir, &["log", "-p"])).expect("utf-8 log output");
+
+    // then: both the tip and the historical file contents appear in the diffs
+    assert!(text.contains("+alpha v2"), "tip content in log: {text}");
+    assert!(
+        text.contains("-alpha"),
+        "historical content faulted in: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_materialize_an_earlier_commit_on_checkout() {
+    // given: a partial clone whose root commit predates two later changes
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let first = rev_parse(&local, "HEAD");
+    commit_file(&local, "a.txt", b"alpha v2\n", "modify a");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+    let clone_dir = clone_repo_with(&server, &url, "clone", &["--filter=blob:none"]);
+
+    // when: checking out the root commit faults in that commit's blob by oid
+    git_ok(&clone_dir, &["checkout", "-q", &first]);
+
+    // then: the earlier contents are restored byte-for-byte and the
+    // later-added file is gone
+    assert_eq!(
+        std::fs::read(clone_dir.join("a.txt")).expect("read a.txt"),
+        b"alpha\n"
+    );
+    assert!(
+        !clone_dir.join("b.txt").exists(),
+        "b.txt absent at the root commit"
+    );
 }

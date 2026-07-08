@@ -19,6 +19,7 @@
 //! directly. Pack bytes are streamed multiplexed over side-band-64k, never
 //! buffered whole.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io;
 
@@ -35,7 +36,7 @@ use tokio::sync::mpsc;
 use crate::AppState;
 use crate::error::{self, Class, Classify};
 use crate::git::pack_out::{PackOutError, write_pack};
-use crate::git::walk::{FilterSpec, Walker};
+use crate::git::walk::{FilterSpec, WalkError, Walker};
 use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
 use crate::storage::values::RefTarget;
@@ -140,12 +141,12 @@ fn error_response<E: Classify + std::error::Error>(err: &E) -> Response {
     }
 }
 
-/// Serve the `fetch` command: run commit discovery and object collection
-/// (`docs/0001-init.md` §command=fetch Phases I and II), then stream the
-/// pack (Phase III). Walk failures surface before the response body starts,
-/// as an in-band `ERR` pkt-line through the same classifier `ls-refs` uses;
-/// once streaming has begun, a failure can only be reported on side-band
-/// channel 3.
+/// Serve the `fetch` command: resolve the wants into the objects to pack
+/// (`docs/0001-init.md` §command=fetch Phases I and II, plus arbitrary-oid
+/// backfill wants), then stream the pack (Phase III). Resolution failures
+/// surface before the response body starts, as an in-band `ERR` pkt-line
+/// through the same classifier `ls-refs` uses; once streaming has begun, a
+/// failure can only be reported on side-band channel 3.
 async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     let parsed = match FetchArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -156,22 +157,15 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     }
 
     let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
-    let selection = match walker.select_commits(&parsed.wants, &parsed.haves).await {
-        Ok(selection) => selection,
-        Err(err) => return error_response(&err),
-    };
-    let collected = match walker
-        .collect(&selection.to_send, &selection.common, &parsed.filter)
-        .await
-    {
-        Ok(collected) => collected,
+    let (collected, common) = match plan_pack(&walker, &parsed).await {
+        Ok(planned) => planned,
         Err(err) => return error_response(&err),
     };
     let Ok(count) = u32::try_from(collected.len()) else {
         return err_line("too many objects for one pack");
     };
 
-    let prefix = match negotiation_prefix(parsed.done, &selection.common) {
+    let prefix = match negotiation_prefix(parsed.done, &common) {
         Ok(prefix) => prefix,
         Err(_) => return http::internal_error(),
     };
@@ -201,6 +195,43 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
             })),
     );
     http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body)
+}
+
+/// Resolve a parsed fetch into the objects to pack and the common haves to
+/// acknowledge. Commit and annotated-tag wants drive commit discovery and
+/// object collection; blob and tree wants are arbitrary-oid backfill wants
+/// (git's `allowAnySHA1InWant`) packed directly by point lookup.
+///
+/// When every want is a blob or tree — a partial clone faulting in objects it
+/// pruned earlier — commit discovery and collection are skipped entirely and
+/// the pack is exactly the wanted objects (`docs/0001-init.md` §Filters). A
+/// mixed request runs the walk over the commit/tag wants and then adds the
+/// directly wanted objects; those are packed even when a filter would drop
+/// them from traversal, because an explicitly requested object is never
+/// filtered out. Directly wanted objects the walk already collected are added
+/// once.
+async fn plan_pack(
+    walker: &Walker,
+    parsed: &FetchArgs,
+) -> Result<(Vec<ObjectId>, Vec<ObjectId>), WalkError> {
+    let partition = walker.partition_wants(&parsed.wants).await?;
+    if partition.history.is_empty() {
+        return Ok((partition.direct, Vec::new()));
+    }
+
+    let selection = walker
+        .select_commits(&partition.history, &parsed.haves)
+        .await?;
+    let mut collected = walker
+        .collect(&selection.to_send, &selection.common, &parsed.filter)
+        .await?;
+    let mut seen: HashSet<ObjectId> = collected.iter().copied().collect();
+    for oid in partition.direct {
+        if seen.insert(oid) {
+            collected.push(oid);
+        }
+    }
+    Ok((collected, selection.common))
 }
 
 /// The pkt-lines that precede the pack bytes. Without `done` this is the

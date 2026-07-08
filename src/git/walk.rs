@@ -130,6 +130,20 @@ pub struct Selection {
     pub common: Vec<ObjectId>,
 }
 
+/// Raw fetch wants split by how they are served, produced by
+/// [`Walker::partition_wants`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WantPartition {
+    /// Wants that drive commit discovery: commits, and annotated tags (which
+    /// [`Walker::select_commits`] peels to a target commit). Kept in want
+    /// order, duplicates included — discovery is idempotent over them.
+    pub history: Vec<ObjectId>,
+    /// Wants packed directly by point lookup: blobs and trees, requested by
+    /// arbitrary oid (git's `allowAnySHA1InWant`). Deduplicated in first-seen
+    /// order.
+    pub direct: Vec<ObjectId>,
+}
+
 /// Marker for a commit's role during discovery: wanted by the client, or
 /// already had by it. HAVE dominates WANT — once a commit is HAVE it never
 /// becomes WANT again.
@@ -246,6 +260,37 @@ impl Walker {
             return Ok(record);
         }
         self.backfill_commit_info(id).await
+    }
+
+    /// Split raw wants by how the fetch must serve each one. Commit and
+    /// annotated-tag wants drive commit discovery and object collection
+    /// (Phases I and II); blob and tree wants are arbitrary-oid backfill
+    /// wants that a partial clone faults in directly, so they bypass the
+    /// commit walk and are packed by point lookup (`docs/0001-init.md`
+    /// §Filters). A want naming an object the repository does not have is a
+    /// [`WalkError::UnknownWant`], surfaced by the caller as an in-band
+    /// protocol error.
+    ///
+    /// Kinds are read via [`ObjectDb::size`], so no blob content is fetched
+    /// just to classify a want.
+    pub async fn partition_wants(&self, wants: &[ObjectId]) -> Result<WantPartition, WalkError> {
+        let mut history = Vec::new();
+        let mut direct = OrderedOidSet::default();
+        for want in wants {
+            let (kind, _) = self
+                .objects
+                .size(self.repo, want)
+                .await?
+                .ok_or(WalkError::UnknownWant(*want))?;
+            match kind {
+                Kind::Commit | Kind::Tag => history.push(*want),
+                Kind::Tree | Kind::Blob => direct.insert(*want),
+            }
+        }
+        Ok(WantPartition {
+            history,
+            direct: direct.into_vec(),
+        })
     }
 
     /// Phase I: decide which commits to send. `wants` are ref tips requested
@@ -981,6 +1026,50 @@ mod tests {
 
         // when
         let result = w.select_commits(&[bogus_oid()], &[]).await;
+
+        // then
+        assert!(matches!(result, Err(WalkError::UnknownWant(id)) if id == bogus_oid()));
+    }
+
+    #[tokio::test]
+    async fn should_partition_wants_into_history_and_direct() {
+        // given: one object of each servable kind
+        let w = walker().await;
+        let b = blob(&w, b"content").await;
+        let t = tree(&w, &[(EntryKind::Blob, "file.txt", b)]).await;
+        let c = commit(&w, t, &[], "one").await;
+        let tg = tag(&w, c, Kind::Commit, "v1").await;
+
+        // when
+        let partition = w.partition_wants(&[c, b, t, tg]).await.expect("partition");
+
+        // then: commits and tags drive discovery; blobs and trees are direct
+        assert_eq!(partition.history, vec![c, tg]);
+        assert_eq!(as_set(&partition.direct), as_set(&[b, t]));
+    }
+
+    #[tokio::test]
+    async fn should_dedup_repeated_direct_wants() {
+        // given: one blob wanted twice
+        let w = walker().await;
+        let b = blob(&w, b"content").await;
+
+        // when
+        let partition = w.partition_wants(&[b, b]).await.expect("partition");
+
+        // then: the direct set holds it exactly once, with no history wants
+        assert_eq!(partition.direct, vec![b]);
+        assert!(partition.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_error_when_partitioning_an_unknown_want() {
+        // given
+        let w = walker().await;
+        chain(&w, 1).await;
+
+        // when
+        let result = w.partition_wants(&[bogus_oid()]).await;
 
         // then
         assert!(matches!(result, Err(WalkError::UnknownWant(id)) if id == bogus_oid()));
