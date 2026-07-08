@@ -2,19 +2,15 @@ Miscreant Git Server
 ====================
 
 The miscreant git server is an OSS, MIT-licensed git server that is
-backed entirely by object storage. This makes it zero-ops, highly
-scalable for high concurrency/agentic git workloads and a cost
-effective code hosting option.
+backed entirely by S3/object storage. This makes it easy operationally,
+scalable for highly concurrent/agentic workloads, and extremely cost
+effective.
 
 Quickstart
 ----------
 
-[Work in Progress] We are working on building deployable binaries,
-for now you can build Miscreant from source and add it as a git remote
-for your project.
-
-Run the server (requires a Rust toolchain). By default it listens on
-127.0.0.1:8470 and stores all data under ./miscreant-data:
+Run the server (requires a Rust toolchain for now). By default it listens
+on 127.0.0.1:8470 and stores all data under ./miscreant-data:
 
     cargo run
 
@@ -30,28 +26,39 @@ Then clone it back from any other directory:
 
 Why Miscreant?
 --------------
-Agents make exceptional use of file systems, and it is increasingly
-clear that having access to a versioned remote file system that can
-handle conflicts amongst multiple agents concurrently access the same
-files is critical.
+
+Miscreant is for developers building infrastructure like remote
+filesystems, sandboxes and harnesses.
 
 Miscreant is a low-level implementation of the git HTTP(S) protocol
 that allows for concurrent, transactional access to multiple git
 repositories backed by object storage. Unlike using an existing Git
-hosting solution like GitHub, Miscreant offers no rate limits, UI or
-workflow/action integration. It is designed to be extremely cheap to
-store enormous amounts of data and serve thousands of concurrent
-reqeusts.
+hosting solution like GitHub, miscreant has no rate limits or infrastructure
+limitations. It is designed to be extremely cheap to store enormous amounts of
+data and serve thousands of concurrent requests.
 
 Miscreant is not a complete developer product, instead the intention is
 to serve as an infrastructure component of other solutions such as
 remote file systems and sandbox backends.
 
+Why Is Miscreant On GitHub?
+---------------------------
+
+As suggested above, miscreant is not a complete developer solution and
+requires additional infrastructure (e.g. branch protection, pull request
+functionality, authN/Z, etc...). We use GitHub to collaborate on the
+development of miscreant and mirror the repository to a self-hosted
+miscreant server.
+
+Also, whether we like it or not, GitHub is still the premier destination
+for open source hosting. miscreant has no intention of disrupting this for
+open source human collaboration.
+
 Architecture Overview
 =====================
 
-Miscreant is a single binary rust server built on [SlateDB](https://slatedb.io)
-that speaks the git HTTPs protocol:
+Miscreant is a single binary rust server built on https://slatedb.io that
+speaks the git HTTP(S) protocol:
 
 ┌───────────┐         ┌───────────┐       ┌S3───────────┐
 │   agent   │────┐    │ Miscreant │█      │┌───────────┐│█
@@ -63,12 +70,23 @@ that speaks the git HTTPs protocol:
 │   human   │────┘    └───────────┘█      └─────────────┘█
 └───────────┘          █████████████       ███████████████
 
-Agents and humans can both concurrently connect to the Miscreant and use it
-to coordinate and resolve conflicts. The data is stored in two locations:
-all git objects (trees, commits, blob IDs) are stored in SlateDB as well
-as any blob content that is under a certain threshold (64KB default) while
-all blobs that exceed this threshold are stored directly in S3. The blobs
-and the slatedb directories are stored within the same S3 bucket.
+Agents and humans can both concurrently connect to miscreant and use it
+to coordinate and resolve conflicts. All git objects (trees, commits, blob IDs)
+are stored in SlateDB as well as any blob content that is under a certain
+threshold (64KB default) while all blobs that exceed this threshold are stored
+directly in S3. The blobs and the slatedb directories are stored within the same
+S3 bucket.
 
-Note that S3 is a placeholder for any object storage system, we could use
-GCS, R2, Tigris, etc...
+> Note that S3 is a placeholder for any object storage system, we could use
+> GCS, R2, Tigris, etc...
+
+Contact/Contribute
+==================
+
+- open an issue / PR
+- email almog [at] responsive [dot] dev
+- X/Twitter @almoggavra
+
+AI contributions are welcome after submitting a human-written issue
+describing the problem/motivations. Any AI usage must disclose the
+model used.

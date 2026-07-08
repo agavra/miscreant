@@ -55,3 +55,73 @@ Miscreant. See `docs/0001-init.md` for the design.
   `git clone` wants every advertised ref (tags included), so clones are
   unaffected; a bare `git fetch` that relies on tag following may not pick
   up a new tag until it asks for the tag ref explicitly.
+
+## Performance / scale
+
+The nonfunctional targets that matter here are set by agent workloads, not
+human ones: ephemeral cold clients, high per-repo concurrency, tiny frequent
+commits, branch-per-agent, and sparse access. Both read and write paths
+reduce to object point-lookups against SlateDB/S3, where per-request latency
+is ~10–50ms but parallelism is effectively free — so most of the work below
+is about trading serial depth for width and avoiding repeated identical work.
+
+- **Read-path traversal should batch lookups per level, not recurse
+  depth-first.** The read latency floor is (serial dependency depth × RTT).
+  The commit walk is bounded by generation depth and the tree walk by tree
+  depth (~5–15); both should issue wide concurrent batches of SlateDB lookups
+  per level rather than the recursive DFS the design pseudocode is written as.
+  The concurrency lives in fan-out width, not depth.
+
+- **Packfile / result cache keyed by `(wants, haves, filter)`.** The flagship
+  agent pattern is fan-out exploration: N agents clone the same commit at
+  once. v1 unpacks and re-packs identical bytes per request (packfile storage
+  is deferred), so the herd pays the full pack CPU cost N times. Caching the
+  packed result (or at least the collected object set) collapses this.
+  Candidate to promote from deferred if concurrent-clone throughput is a
+  target.
+
+- **Have-set expansion cache keyed by commit SHA.** Already flagged as
+  deferred in the design. Incremental fetch's dominant cost is expanding the
+  have-frontier, recomputed identically every request; haves are almost
+  always recent tips, so the cache is small and hot. Likely not actually
+  deferrable for agents that sync frequently.
+
+- **Promote-before-CAS generates garbage under push contention.** Objects are
+  promoted to SlateDB before the ref CAS, so every push that loses a
+  many-writers-one-branch race leaves dangling promoted objects. With GC
+  deferred, sustained contention grows storage without bound. The upside is
+  that a loser's objects are already present, making its retry cheap — but the
+  many-writers-one-branch workload cannot be supported without a GC story.
+
+- **Ref advertisement scales with total ref count.** Branch-per-agent
+  explodes the ref table, and every discovery / `ls-refs` without a prefix
+  advertises all of it. Establish a namespacing convention for agent branches
+  and lean on `ref-prefix` scans so a fleet does not pay O(total refs) per
+  operation.
+
+- **Stateless server loses SlateDB's block cache on scale-up.** An autoscaled
+  or redeployed server starts cold, so its first requests pay full S3 latency
+  for blocks a warm instance would have cached. If server cold-start latency
+  matters for the fleet, consider a shared warm cache tier or an on-disk block
+  cache.
+
+- **Optimize for time-to-first-useful-file, not just time-to-full-clone.**
+  The winning agent pattern is partial (`blob:none` / `blob:limit`) plus
+  sparse access, not repeated full clones. Treat filter/sparse support as a
+  first-class latency path rather than a nicety.
+
+- **"Conflicts" is a client concern; the server only does ref CAS.** Actual
+  merge-conflict resolution lives in the client/agent. As a server NFR,
+  "conflicts" means CAS-contention throughput and retry-loop convergence, not
+  server-side merging.
+
+## Benchmarking
+
+- **Bench harness with agent-shaped workloads.** The SlateDB dogfood repo
+  (489 blobs, 26MB) is a correctness fixture, not a load fixture. To find
+  limits, drive: (a) linux/cpython-scale repos for read-path depth, (b)
+  N-clone-same-commit for the thundering herd, (c) M-agents-push-main for CAS
+  contention, (d) branch-explosion for ref scaling. Headline metrics: p99
+  cold clone / incremental-sync latency, concurrent-clone throughput, push p99
+  and CAS-retry convergence, and S3 request count per clone/push (request
+  count, not bytes, is usually the bill).
