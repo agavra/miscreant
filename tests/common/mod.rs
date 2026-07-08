@@ -189,6 +189,26 @@ pub fn pack_revs(dir: &Path, extra: &[&str], revs: &[&str]) -> Vec<u8> {
     git_ok_with_input(dir, &args, input.as_bytes())
 }
 
+/// Build a pack of exactly the listed objects with `git pack-objects
+/// --stdout` (one oid per stdin line). Unlike [`pack_revs`], no reachability
+/// closure is added: the pack holds precisely `oids`, which lets a test stage
+/// an object whose referents are deliberately absent.
+#[allow(dead_code)]
+pub fn pack_objects(dir: &Path, oids: &[&str]) -> Vec<u8> {
+    let mut input = oids.join("\n");
+    input.push('\n');
+    git_ok_with_input(dir, &["pack-objects", "-q", "--stdout"], input.as_bytes())
+}
+
+/// Resolve a revision to its full hex object id with `git rev-parse`.
+#[allow(dead_code)]
+pub fn rev_parse(dir: &Path, rev: &str) -> String {
+    String::from_utf8(git_ok(dir, &["rev-parse", rev]))
+        .expect("utf-8 rev-parse output")
+        .trim()
+        .to_owned()
+}
+
 /// List every object reachable per `git rev-list --objects <revs>` as
 /// `(oid, kind, body)`, with bodies read via `git cat-file --batch`.
 #[allow(dead_code)]
