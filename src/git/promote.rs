@@ -18,7 +18,7 @@ use crate::git::ingest::{IngestError, StagedPack};
 use crate::git::walk::{WalkError, Walker};
 use crate::storage::keys::RepoId;
 use crate::storage::values::CommitGraphRecord;
-use crate::storage::{ObjectDb, ObjectDbError, Store, StoreError};
+use crate::storage::{Durability, ObjectDb, ObjectDbError, Store, StoreError};
 
 /// Errors returned by [`validate_and_promote`].
 #[derive(Debug, thiserror::Error)]
@@ -146,21 +146,27 @@ pub async fn validate_and_promote(
     // function (see its comment) is what makes the batch as a whole safe.
     let mut promotion = Promotion::default();
     for (oid, body) in blobs {
-        objectdb.put_relaxed(repo, &oid, Kind::Blob, body).await?;
+        objectdb
+            .put(repo, &oid, Kind::Blob, body, Durability::Relaxed)
+            .await?;
         promotion.promoted.push(oid);
     }
     for (oid, body) in trees {
-        objectdb.put_relaxed(repo, &oid, Kind::Tree, body).await?;
+        objectdb
+            .put(repo, &oid, Kind::Tree, body, Durability::Relaxed)
+            .await?;
         promotion.promoted.push(oid);
     }
     for (oid, body) in &commits {
         objectdb
-            .put_relaxed(repo, oid, Kind::Commit, body.clone())
+            .put(repo, oid, Kind::Commit, body.clone(), Durability::Relaxed)
             .await?;
         promotion.promoted.push(*oid);
     }
     for (oid, body) in tags {
-        objectdb.put_relaxed(repo, &oid, Kind::Tag, body).await?;
+        objectdb
+            .put(repo, &oid, Kind::Tag, body, Durability::Relaxed)
+            .await?;
         promotion.promoted.push(oid);
     }
 
@@ -188,7 +194,9 @@ pub async fn validate_and_promote(
             root_tree,
             parents,
         };
-        store.put_commit_graph_relaxed(repo, oid, &record).await?;
+        store
+            .put_commit_graph(repo, oid, &record, Durability::Relaxed)
+            .await?;
         promotion.commits.push(*oid);
     }
 

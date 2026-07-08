@@ -11,4 +11,4 @@ pub mod values;
 
 pub use blobs::{BlobStore, BlobStoreError};
 pub use objectdb::{ObjectDb, ObjectDbError};
-pub use store::{RefOutcome, RefUpdate, RefUpdateResult, RepoMeta, Store, StoreError};
+pub use store::{Durability, RefOutcome, RefUpdate, RefUpdateResult, RepoMeta, Store, StoreError};

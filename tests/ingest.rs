@@ -13,7 +13,7 @@ use gix_pack::bundle::write::Error as PackWriteError;
 use gix_pack::data::input::Error as PackInputError;
 use gix_pack::index::write::Error as IndexWriteError;
 use miscreant::git::{IngestError, StagedPack, ingest_pack};
-use miscreant::storage::{BlobStore, ObjectDb, RepoMeta, Store};
+use miscreant::storage::{BlobStore, Durability, ObjectDb, RepoMeta, Store};
 use slatedb::object_store::{self, ObjectStore};
 use tempfile::TempDir;
 
@@ -148,7 +148,7 @@ async fn should_resolve_thin_pack_bases_from_committed_objects() {
 
     let (db, meta) = memory_objectdb("ingest/thin").await;
     for (oid, kind, body) in rev_objects(&fx.repo_dir, &[&base]) {
-        db.put(meta.id, &oid, kind, Bytes::from(body))
+        db.put(meta.id, &oid, kind, Bytes::from(body), Durability::Durable)
             .await
             .expect("seed base object");
     }

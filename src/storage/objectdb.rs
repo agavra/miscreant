@@ -12,7 +12,7 @@ use gix_object::Kind;
 
 use crate::storage::blobs::{BlobStore, BlobStoreError};
 use crate::storage::keys::RepoId;
-use crate::storage::store::{Store, StoreError};
+use crate::storage::store::{Durability, Store, StoreError};
 use crate::storage::values::ObjectRecord;
 
 /// Errors returned by [`ObjectDb`] operations.
@@ -56,8 +56,11 @@ impl ObjectDb {
     }
 
     /// Store `body` (the object's content, with no git header) as `oid` of
-    /// kind `kind`, waiting for the record write to become durable before
-    /// returning. A no-op if `oid` already has a record. Callers are
+    /// kind `kind`, writing the object record with the requested
+    /// [`Durability`]. A no-op if `oid` already has a record. An offloaded
+    /// blob's content finishes uploading to the blob store (awaited here)
+    /// before its pointer record is written, regardless of durability mode —
+    /// only the SlateDB record write itself is relaxed. Callers are
     /// responsible for `oid` being the hash of the canonical encoding of
     /// `kind`/`body`.
     pub async fn put(
@@ -66,32 +69,7 @@ impl ObjectDb {
         oid: &oid,
         kind: Kind,
         body: Bytes,
-    ) -> Result<(), ObjectDbError> {
-        self.put_with(repo, oid, kind, body, false).await
-    }
-
-    /// Like [`ObjectDb::put`], but the object record write does not wait
-    /// for durability. An offloaded blob's content still finishes uploading
-    /// to the blob store (awaited here) before the record referencing it is
-    /// submitted, regardless of durability mode — only the SlateDB record
-    /// write itself is relaxed.
-    pub async fn put_relaxed(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        kind: Kind,
-        body: Bytes,
-    ) -> Result<(), ObjectDbError> {
-        self.put_with(repo, oid, kind, body, true).await
-    }
-
-    async fn put_with(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        kind: Kind,
-        body: Bytes,
-        relaxed: bool,
+        durability: Durability,
     ) -> Result<(), ObjectDbError> {
         if self.store.object_exists(repo, oid).await? {
             return Ok(());
@@ -110,11 +88,9 @@ impl ObjectDb {
             Kind::Tag => ObjectRecord::Tag(body),
         };
 
-        if relaxed {
-            self.store.put_object_relaxed(repo, oid, &record).await?;
-        } else {
-            self.store.put_object(repo, oid, &record).await?;
-        }
+        self.store
+            .put_object(repo, oid, &record, durability)
+            .await?;
         Ok(())
     }
 
@@ -211,7 +187,7 @@ mod tests {
         let body = Bytes::from_static(b"12345678"); // exactly 8 bytes
 
         // when
-        db.put(repo, &id, Kind::Blob, body.clone())
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
             .await
             .expect("put");
 
@@ -237,7 +213,7 @@ mod tests {
         let body = Bytes::from_static(b"123456789"); // 9 bytes, threshold + 1
 
         // when
-        db.put(repo, &id, Kind::Blob, body.clone())
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
             .await
             .expect("put");
 
@@ -268,7 +244,9 @@ mod tests {
 
         // when/then: each kind is its own put -> get -> compare cycle.
         for (id, kind, body) in cases {
-            db.put(repo, &id, kind, body.clone()).await.expect("put");
+            db.put(repo, &id, kind, body.clone(), Durability::Durable)
+                .await
+                .expect("put");
             assert_eq!(
                 db.get(repo, &id).await.expect("get").expect("present"),
                 (kind, body)
@@ -282,7 +260,7 @@ mod tests {
         let (db, repo) = objectdb(65536).await;
         let id = oid(b'c');
         let body = Bytes::from_static(b"small");
-        db.put(repo, &id, Kind::Blob, body.clone())
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
             .await
             .expect("put");
 
@@ -299,7 +277,7 @@ mod tests {
         let (db, repo) = objectdb(4).await;
         let id = oid(b'd');
         let body = Bytes::from_static(b"this is bigger than four bytes");
-        db.put(repo, &id, Kind::Blob, body.clone())
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
             .await
             .expect("put");
 
@@ -316,7 +294,7 @@ mod tests {
         let (db, repo) = objectdb(65536).await;
         let id = oid(b'e');
         let body = Bytes::from_static(b"tree-body-bytes");
-        db.put(repo, &id, Kind::Tree, body.clone())
+        db.put(repo, &id, Kind::Tree, body.clone(), Durability::Durable)
             .await
             .expect("put");
 
@@ -333,7 +311,7 @@ mod tests {
         let (db, repo) = objectdb(65536).await;
         let id = oid(b'f');
         let first = Bytes::from_static(b"first content");
-        db.put(repo, &id, Kind::Blob, first.clone())
+        db.put(repo, &id, Kind::Blob, first.clone(), Durability::Durable)
             .await
             .expect("first put");
 
@@ -342,7 +320,9 @@ mod tests {
         // overwrite the existing record (content-addressing means callers
         // never legitimately do this, but the no-op guard must still hold).
         let second = Bytes::from_static(b"different content entirely");
-        db.put(repo, &id, Kind::Blob, second).await.expect("noop");
+        db.put(repo, &id, Kind::Blob, second, Durability::Durable)
+            .await
+            .expect("noop");
 
         // then
         assert_eq!(

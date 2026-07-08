@@ -16,7 +16,7 @@ use gix_object::{CommitRef, Kind, TagRef, TreeRefIter};
 
 use crate::storage::keys::RepoId;
 use crate::storage::values::CommitGraphRecord;
-use crate::storage::{ObjectDb, ObjectDbError, Store, StoreError};
+use crate::storage::{Durability, ObjectDb, ObjectDbError, Store, StoreError};
 
 /// Errors surfaced by the fetch walk.
 #[derive(Debug, thiserror::Error)]
@@ -470,7 +470,7 @@ impl Walker {
                     parents,
                 };
                 self.store
-                    .put_commit_graph_relaxed(self.repo, &top, &record)
+                    .put_commit_graph(self.repo, &top, &record, Durability::Relaxed)
                     .await?;
                 generations.insert(top, generation);
                 if top == target {
@@ -630,7 +630,13 @@ mod tests {
     async fn put_object(w: &Walker, kind: Kind, body: &[u8]) -> ObjectId {
         let id = gix_object::compute_hash(gix_hash::Kind::Sha1, kind, body).expect("hash");
         w.objects
-            .put(w.repo, &id, kind, Bytes::copy_from_slice(body))
+            .put(
+                w.repo,
+                &id,
+                kind,
+                Bytes::copy_from_slice(body),
+                Durability::Durable,
+            )
             .await
             .expect("put object");
         id
@@ -721,7 +727,7 @@ mod tests {
             parents: vec![ObjectId::from_hex(&[b'c'; 40]).expect("valid hex")],
         };
         w.store
-            .put_commit_graph(w.repo, &id, &record)
+            .put_commit_graph(w.repo, &id, &record, Durability::Durable)
             .await
             .expect("seed record");
 
@@ -1079,6 +1085,7 @@ mod tests {
                     root_tree: t1,
                     parents: vec![],
                 },
+                Durability::Durable,
             )
             .await
             .expect("seed c1");
@@ -1091,6 +1098,7 @@ mod tests {
                     root_tree: t3,
                     parents: vec![c2],
                 },
+                Durability::Durable,
             )
             .await
             .expect("seed c3");
@@ -1146,6 +1154,7 @@ mod tests {
                         root_tree,
                         parents,
                     },
+                    Durability::Durable,
                 )
                 .await
                 .expect("seed corrupt record");

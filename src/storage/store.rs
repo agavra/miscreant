@@ -176,14 +176,18 @@ pub enum RefOutcome {
     Rejected(String),
 }
 
-/// Durability requested for a single SlateDB write. `Durable` blocks the
-/// write until SlateDB's WAL flush task has persisted it (the default for
-/// every write except promotion and commit-graph backfill); `Relaxed`
-/// returns as soon as the write lands in the in-memory WAL buffer, leaving
-/// durability to a later [`Store::flush`] call or another durable write.
+/// Durability requested for a single SlateDB write. `Durable` blocks until
+/// SlateDB's WAL flush task has persisted the write; `Relaxed` returns as soon
+/// as the write lands in the in-memory WAL buffer, leaving durability to a
+/// later [`Store::flush`] call or a subsequent durable write. Every caller of
+/// the writes that accept this parameter states its choice explicitly — there
+/// is no implicit fallback — so the decision is visible in review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Durability {
+pub enum Durability {
+    /// Wait for the write to be persisted before returning.
     Durable,
+    /// Return once the write is buffered; a later flush or durable write
+    /// makes it persistent.
     Relaxed,
 }
 
@@ -384,31 +388,8 @@ impl Store {
         }
     }
 
-    /// Write an object record, waiting for it to become durable before
-    /// returning.
+    /// Write an object record with the requested [`Durability`].
     pub async fn put_object(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        record: &ObjectRecord,
-    ) -> Result<(), StoreError> {
-        self.put_object_with(repo, oid, record, Durability::Durable)
-            .await
-    }
-
-    /// Write an object record without waiting for durability; see
-    /// [`Durability::Relaxed`].
-    pub async fn put_object_relaxed(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        record: &ObjectRecord,
-    ) -> Result<(), StoreError> {
-        self.put_object_with(repo, oid, record, Durability::Relaxed)
-            .await
-    }
-
-    async fn put_object_with(
         &self,
         repo: RepoId,
         oid: &oid,
@@ -564,31 +545,8 @@ impl Store {
         }
     }
 
-    /// Write a commit-graph record, waiting for it to become durable before
-    /// returning.
+    /// Write a commit-graph record with the requested [`Durability`].
     pub async fn put_commit_graph(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        record: &CommitGraphRecord,
-    ) -> Result<(), StoreError> {
-        self.put_commit_graph_with(repo, oid, record, Durability::Durable)
-            .await
-    }
-
-    /// Write a commit-graph record without waiting for durability; see
-    /// [`Durability::Relaxed`].
-    pub async fn put_commit_graph_relaxed(
-        &self,
-        repo: RepoId,
-        oid: &oid,
-        record: &CommitGraphRecord,
-    ) -> Result<(), StoreError> {
-        self.put_commit_graph_with(repo, oid, record, Durability::Relaxed)
-            .await
-    }
-
-    async fn put_commit_graph_with(
         &self,
         repo: RepoId,
         oid: &oid,
@@ -1157,7 +1115,7 @@ mod tests {
         // when
         let record = ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello"));
         store
-            .put_object(repo, &blob, &record)
+            .put_object(repo, &blob, &record, Durability::Durable)
             .await
             .expect("put object");
 
@@ -1178,7 +1136,7 @@ mod tests {
 
         // when
         store
-            .put_commit_graph(repo, &commit, &graph)
+            .put_commit_graph(repo, &commit, &graph, Durability::Durable)
             .await
             .expect("put graph");
 
