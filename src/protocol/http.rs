@@ -197,6 +197,34 @@ fn service_param(query: Option<&str>) -> Option<String> {
         .find_map(|pair| pair.strip_prefix("service=").map(|value| value.to_owned()))
 }
 
+/// Classify a request into the fixed `endpoint` label used by the HTTP
+/// request metrics: `advert-upload`/`advert-receive` for `GET .../info/refs`
+/// (distinguished by its `service` query parameter), or
+/// `receive-pack`/`upload-pack` for the matching POST RPC. `None` for
+/// anything else (`/healthz`, `/metrics`, an advert request with no
+/// recognized `service`, or a path this server does not route at all) —
+/// those are excluded from the metrics rather than forced into one of the
+/// four labels, so the label's cardinality never grows no matter what a
+/// client requests. `path` may carry a leading slash (as
+/// `Uri::path()` returns it) or not.
+pub(crate) fn classify_endpoint(path: &str, query: Option<&str>) -> Option<&'static str> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if strip_endpoint(path, INFO_REFS).is_some() {
+        return match service_param(query).as_deref() {
+            Some(SERVICE_UPLOAD_PACK) => Some("advert-upload"),
+            Some(SERVICE_RECEIVE_PACK) => Some("advert-receive"),
+            _ => None,
+        };
+    }
+    if strip_endpoint(path, RECEIVE_PACK).is_some() {
+        return Some("receive-pack");
+    }
+    if strip_endpoint(path, UPLOAD_PACK).is_some() {
+        return Some("upload-pack");
+    }
+    None
+}
+
 /// Whether the request opts into protocol v2 via the `Git-Protocol` header.
 pub(crate) fn wants_v2(headers: &HeaderMap) -> bool {
     headers
@@ -309,6 +337,41 @@ mod tests {
         );
         assert_eq!(service_param(Some("foo=bar")), None);
         assert_eq!(service_param(None), None);
+    }
+
+    #[test]
+    fn should_classify_advert_and_rpc_endpoints_for_metrics() {
+        // given/when/then: each of the four served paths yields its label
+        assert_eq!(
+            classify_endpoint("org/repo/info/refs", Some("service=git-upload-pack")),
+            Some("advert-upload")
+        );
+        assert_eq!(
+            classify_endpoint("/org/repo/info/refs", Some("service=git-receive-pack")),
+            Some("advert-receive")
+        );
+        assert_eq!(
+            classify_endpoint("repo/git-receive-pack", None),
+            Some("receive-pack")
+        );
+        assert_eq!(
+            classify_endpoint("repo/git-upload-pack", None),
+            Some("upload-pack")
+        );
+    }
+
+    #[test]
+    fn should_not_classify_operational_or_unrecognized_paths() {
+        // given/when/then: /healthz, /metrics, an advert with no recognized
+        // service, and a path matching no endpoint at all are all excluded
+        assert_eq!(classify_endpoint("healthz", None), None);
+        assert_eq!(classify_endpoint("metrics", None), None);
+        assert_eq!(classify_endpoint("repo/info/refs", None), None);
+        assert_eq!(
+            classify_endpoint("repo/info/refs", Some("service=other")),
+            None
+        );
+        assert_eq!(classify_endpoint("repo/some-other-path", None), None);
     }
 
     #[test]

@@ -319,6 +319,7 @@ impl Store {
             match txn.commit().await {
                 Ok(_) => {
                     tracing::info!(repo = %name, repo_id = id.0, "repository created");
+                    metrics::counter!("repo_auto_created_total").increment(1);
                     return Ok(RepoMeta {
                         id,
                         object_format: Kind::Sha1,
@@ -528,6 +529,7 @@ impl Store {
                             attempts = attempt,
                             "ref compare-and-swap retry budget exhausted"
                         );
+                        metrics::counter!("store_cas_exhausted_total").increment(1);
                         return Ok(updates
                             .iter()
                             .map(|u| RefUpdateResult {
@@ -541,6 +543,7 @@ impl Store {
                         attempt,
                         "ref compare-and-swap conflict; retrying"
                     );
+                    metrics::counter!("store_cas_retries_total").increment(1);
                 }
                 Err(e) => return Err(e.into()),
             }

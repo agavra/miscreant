@@ -216,6 +216,11 @@ pub async fn validate_and_promote(
     // that contains a ref necessarily contains that ref's entire closure.
     store.flush().await?;
 
+    metrics::counter!("objects_promoted_total", "kind" => "blob").increment(blob_count as u64);
+    metrics::counter!("objects_promoted_total", "kind" => "tree").increment(tree_count as u64);
+    metrics::counter!("objects_promoted_total", "kind" => "commit").increment(commits.len() as u64);
+    metrics::counter!("objects_promoted_total", "kind" => "tag").increment(tag_count as u64);
+
     tracing::debug!(
         blobs = blob_count,
         trees = tree_count,

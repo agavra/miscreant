@@ -104,8 +104,17 @@ pub async fn upload_pack(
     let meta = match state.store.lookup_repo(repo).await {
         Ok(Some(meta)) => meta,
         Ok(None) => return http::plain(StatusCode::NOT_FOUND, "repository not found"),
-        Err(err) => return error_response(&err),
+        Err(err) => return error_response(error::classify(&err)),
     };
+
+    let command_label = match request.command.as_str() {
+        "ls-refs" => "ls-refs",
+        "fetch" => "fetch",
+        "object-format" => "object-format",
+        "object-info" => "object-info",
+        _ => "unknown",
+    };
+    metrics::counter!("upload_pack_commands_total", "command" => command_label).increment(1);
 
     match request.command.as_str() {
         "ls-refs" => ls_refs(state, &meta, &request.args).await,
@@ -137,11 +146,22 @@ fn err_line(message: &str) -> Response {
     }
 }
 
-/// Map a domain error to its wire response through [`error::classify`]: a
+/// Reject a `fetch` request with an in-band `ERR`, counting it toward
+/// `fetch_total{outcome="rejected"}`. Only argument-shape rejections decided
+/// directly in [`fetch`] go through here; a rejection classified from a
+/// domain error (via [`error::classify`]) is counted at its own call site so
+/// a server-side fault (never "rejected") is not double-counted.
+fn reject_fetch(message: &str) -> Response {
+    metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
+    err_line(message)
+}
+
+/// Render a domain error's protocol [`Class`] (from [`error::classify`],
+/// called once by the caller so a server fault is logged exactly once): a
 /// client-caused failure becomes an in-band `ERR` pkt-line, an absent
-/// repository a 404, and an internal fault a logged 500.
-fn error_response<E: Classify + std::error::Error>(err: &E) -> Response {
-    match error::classify(err) {
+/// repository a 404, and an internal fault a generic 500.
+fn error_response(class: Class) -> Response {
+    match class {
         Class::Client(reason) => err_line(&reason),
         Class::NotFound => http::plain(StatusCode::NOT_FOUND, "repository not found"),
         Class::Server => http::internal_error(),
@@ -158,19 +178,25 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     let start = Instant::now();
     let parsed = match FetchArgs::parse(args) {
         Ok(parsed) => parsed,
-        Err(message) => return err_line(&message),
+        Err(message) => return reject_fetch(&message),
     };
     if parsed.wants.is_empty() {
-        return err_line("fetch requires at least one want");
+        return reject_fetch("fetch requires at least one want");
     }
 
     let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
     let (collected, common) = match plan_pack(&walker, &parsed).await {
         Ok(planned) => planned,
-        Err(err) => return error_response(&err),
+        Err(err) => {
+            let class = error::classify(&err);
+            if matches!(class, Class::Client(_)) {
+                metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
+            }
+            return error_response(class);
+        }
     };
     let Ok(count) = u32::try_from(collected.len()) else {
-        return err_line("too many objects for one pack");
+        return reject_fetch("too many objects for one pack");
     };
 
     // The read-path story for one fetch. Timed to the point the pack is
@@ -183,6 +209,8 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
         elapsed_ms = start.elapsed().as_millis() as u64,
         "fetch planned"
     );
+    metrics::counter!("fetch_total", "outcome" => "ok").increment(1);
+    metrics::histogram!("fetch_objects_packed").record(f64::from(count));
 
     let prefix = match negotiation_prefix(parsed.done, &common) {
         Ok(prefix) => prefix,
@@ -328,9 +356,15 @@ fn stream_pack(
     let mut writer = BandWriter {
         tx: body.clone(),
         buf: Vec::new(),
+        bytes_written: 0,
     };
     let input = std::iter::from_fn(|| objects.blocking_recv());
-    match write_pack(input, count, object_hash, &mut writer) {
+    let outcome = write_pack(input, count, object_hash, &mut writer);
+    // Counted here because this is where the true byte count exists: bytes
+    // actually handed to the response channel, whether the pack completed or
+    // ended mid-stream (a client abort still moved this many bytes).
+    metrics::histogram!("fetch_pack_bytes").record(writer.bytes_written as f64);
+    match outcome {
         Ok(_) => {
             if !no_progress {
                 let line = format!("packed {count} objects\n");
@@ -373,10 +407,14 @@ fn send_band(tx: &mpsc::Sender<Bytes>, channel: Channel, data: &[u8]) -> io::Res
 struct BandWriter {
     tx: mpsc::Sender<Bytes>,
     buf: Vec<u8>,
+    /// Total bytes handed to [`io::Write::write`] so far — the pack's true
+    /// output size, independent of side-band/pkt-line framing overhead.
+    bytes_written: u64,
 }
 
 impl io::Write for BandWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.bytes_written += data.len() as u64;
         self.buf.extend_from_slice(data);
         while self.buf.len() >= MAX_BAND_DATA {
             let rest = self.buf.split_off(MAX_BAND_DATA);
@@ -503,7 +541,7 @@ async fn object_info(state: &AppState, meta: &RepoMeta, args: &[String]) -> Resp
         let size = match state.objectdb.size(meta.id, oid).await {
             Ok(Some((_, size))) => size,
             Ok(None) => return err_line(&format!("unknown object {oid}")),
-            Err(err) => return error_response(&err),
+            Err(err) => return error_response(error::classify(&err)),
         };
         let line = format!("{} {size}\n", oid.to_hex());
         if encode::data_to_write(line.as_bytes(), &mut body).is_err() {
@@ -562,7 +600,7 @@ async fn ls_refs(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response
     };
     match build_ls_refs(state, meta.id, &parsed).await {
         Ok(body) => http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body),
-        Err(err) => error_response(&err),
+        Err(err) => error_response(error::classify(&err)),
     }
 }
 
@@ -594,7 +632,11 @@ async fn build_ls_refs(
                     encode::data_to_write(line.as_bytes(), &mut body)?;
                     advertised += 1;
                 } else {
-                    tracing::warn!(
+                    // A dangling HEAD is the normal state of every
+                    // pre-first-push repository, and this event is
+                    // client-reachable at will (auto-create an empty repo,
+                    // then `ls-refs` without `unborn`): not warn-worthy.
+                    tracing::debug!(
                         reference = %name,
                         reason = "dangling",
                         "symref routed around during advertisement"

@@ -44,16 +44,22 @@ impl BlobStore {
     /// content. Callers only ever write a blob whose `oid` is the hash of
     /// `bytes`, so a rewrite is always a no-op in content terms.
     pub async fn put(&self, oid: &oid, bytes: Bytes) -> Result<(), BlobStoreError> {
+        let len = bytes.len() as u64;
         self.store
             .put(&blob_path(oid), PutPayload::from(bytes))
             .await?;
+        metrics::counter!("blobstore_operations_total", "op" => "put").increment(1);
+        metrics::counter!("blobstore_bytes_total", "op" => "put").increment(len);
         Ok(())
     }
 
     /// Read the bytes stored at `oid`'s fanout path.
     pub async fn get(&self, oid: &oid) -> Result<Bytes, BlobStoreError> {
         let result = self.store.get(&blob_path(oid)).await?;
-        Ok(result.bytes().await?)
+        let bytes = result.bytes().await?;
+        metrics::counter!("blobstore_operations_total", "op" => "get").increment(1);
+        metrics::counter!("blobstore_bytes_total", "op" => "get").increment(bytes.len() as u64);
+        Ok(bytes)
     }
 
     /// Whether content exists at `oid`'s fanout path.

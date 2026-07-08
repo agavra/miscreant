@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use miscreant::git::walk::Walker;
 use miscreant::{AppState, Config, app};
 use tokio::net::TcpListener;
@@ -82,7 +83,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
     tracing::info!(addr = %config.bind_addr, "listening");
 
-    let state = AppState::new(config)
+    // Install the process-wide recorder before anything records through the
+    // `metrics` facade, and describe every metric only after installing it:
+    // `describe_*` targets whichever recorder is currently global, so an
+    // earlier call would register descriptions on the default no-op recorder
+    // and lose them.
+    let builder = miscreant::telemetry::configure_byte_buckets(PrometheusBuilder::new())
+        .context("failed to configure metrics buckets")?;
+    let metrics_handle = builder
+        .install_recorder()
+        .context("failed to install metrics recorder")?;
+    miscreant::telemetry::describe();
+
+    let state = AppState::with_metrics(config, metrics_handle)
         .await
         .context("failed to open storage")?;
     axum::serve(listener, app(state))

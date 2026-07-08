@@ -6,6 +6,7 @@ use std::process::{Command, Output, Stdio};
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use miscreant::storage::Store;
 use miscreant::{AppState, Config, app};
 use tempfile::TempDir;
@@ -36,8 +37,23 @@ pub struct TestServer {
 impl TestServer {
     /// Bind `127.0.0.1:0` and serve the app in a background task.
     pub async fn spawn(config: Config) -> TestServer {
-        let tempdir = TempDir::new().expect("create test tempdir");
         let state = AppState::new(config).await.expect("build app state");
+        Self::from_state(state).await
+    }
+
+    /// Like [`TestServer::spawn`], but builds application state around
+    /// `metrics` instead of a private, uninstalled handle — for tests that
+    /// scrape `/metrics` and need it wired to the process's global recorder.
+    #[allow(dead_code)]
+    pub async fn spawn_with_metrics(config: Config, metrics: PrometheusHandle) -> TestServer {
+        let state = AppState::with_metrics(config, metrics)
+            .await
+            .expect("build app state");
+        Self::from_state(state).await
+    }
+
+    async fn from_state(state: AppState) -> TestServer {
+        let tempdir = TempDir::new().expect("create test tempdir");
         let store = state.store.clone();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

@@ -270,6 +270,7 @@ impl Walker {
         if let Some(record) = self.store.get_commit_graph(self.repo, id).await? {
             return Ok(record);
         }
+        metrics::counter!("commit_graph_backfills_total").increment(1);
         self.backfill_commit_info(id).await
     }
 

@@ -20,6 +20,8 @@ gix-pack = { version = "0.72.0", default-features = false, features = [
     "sha256",
 ] }
 gix-packetline-blocking = "0.19.3"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 slatedb = { version = "0.14.1", features = ["aws"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"

@@ -46,6 +46,10 @@ pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response
             return http::plain(StatusCode::BAD_REQUEST, "malformed receive-pack request");
         }
     };
+    // The pack is the dominant share of `pack_bytes` for any push carrying
+    // one; recorded here (the byte count already exists in the received
+    // body) regardless of how the push is ultimately resolved.
+    metrics::histogram!("push_pack_bytes").record(pack_bytes as f64);
 
     // Resolve or auto-create the repository, mirroring the advertisement.
     let meta = match resolve_repo(state, repo).await {
@@ -56,6 +60,7 @@ pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response
 
     // Ingest the pack. A delete-only push carries none, and `ingest_pack`
     // treats zero bytes as an empty pack, so this is safe to call regardless.
+    let ingest_start = Instant::now();
     let staged = match ingest_pack(
         io::Cursor::new(request.pack.clone()),
         &state.objectdb,
@@ -67,15 +72,18 @@ pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response
         Ok(staged) => staged,
         Err(err) => return push_failed(&request, error::classify(&err)),
     };
+    metrics::histogram!("ingest_duration_seconds").record(ingest_start.elapsed().as_secs_f64());
 
     // Validate connectivity and promote the new objects, with the non-delete
     // new-oids as the reachability tips.
     let tips: Vec<ObjectId> = request.commands.iter().filter_map(|cmd| cmd.new).collect();
+    let promote_start = Instant::now();
     let promotion =
         match validate_and_promote(&staged, &tips, &state.objectdb, &state.store, meta.id).await {
             Ok(promotion) => promotion,
             Err(err) => return push_failed(&request, error::classify(&err)),
         };
+    metrics::histogram!("promote_duration_seconds").record(promote_start.elapsed().as_secs_f64());
 
     // Apply the ref updates as compare-and-swap.
     let updates: Vec<RefUpdate> = request
@@ -138,6 +146,7 @@ fn push_failed(request: &Request, class: Class) -> Response {
     match class {
         Class::Client(reason) => {
             tracing::debug!(reason = %reason, "push rejected");
+            metrics::counter!("push_total", "outcome" => "unpack_failed").increment(1);
             let statuses = request
                 .commands
                 .iter()
@@ -156,21 +165,33 @@ fn push_failed(request: &Request, class: Class) -> Response {
 }
 
 /// Render a successful pack: `unpack ok` followed by each command's
-/// compare-and-swap outcome.
+/// compare-and-swap outcome. Records `push_ref_updates_total` per ref and
+/// `push_total` for the push as a whole: `ok` when every ref updated,
+/// `ref_rejected` when at least one command's CAS was rejected.
 fn report_success(request: &Request, results: &[RefUpdateResult]) -> Response {
+    let mut any_rejected = false;
     let statuses = results
         .iter()
         .map(|result| {
             let status = match &result.outcome {
-                RefOutcome::Updated => RefStatus::Ok,
+                RefOutcome::Updated => {
+                    metrics::counter!("push_ref_updates_total", "outcome" => "updated")
+                        .increment(1);
+                    RefStatus::Ok
+                }
                 RefOutcome::Rejected(reason) => {
                     tracing::debug!(reference = %result.name, reason = %reason, "ref rejected");
+                    metrics::counter!("push_ref_updates_total", "outcome" => "rejected")
+                        .increment(1);
+                    any_rejected = true;
                     RefStatus::Ng(reason.clone())
                 }
             };
             (result.name.clone(), status)
         })
         .collect::<Vec<_>>();
+    let outcome = if any_rejected { "ref_rejected" } else { "ok" };
+    metrics::counter!("push_total", "outcome" => outcome).increment(1);
     build_report(&request.caps, "unpack ok", &statuses)
 }
 
