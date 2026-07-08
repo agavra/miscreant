@@ -328,9 +328,13 @@ impl Walker {
     pub async fn rebuild_commit_graph(&self) -> Result<usize, WalkError> {
         let refs = self.store.list_refs(self.repo, None).await?;
         let mut roots = Vec::new();
-        for (_, target) in refs {
-            if let Some(commit_id) = self.resolve_commit_tip(target).await? {
-                roots.push(commit_id);
+        for (name, target) in refs {
+            match self.resolve_commit_tip(target).await? {
+                Some(commit_id) => roots.push(commit_id),
+                None => tracing::warn!(
+                    reference = %name,
+                    "ref does not resolve to a commit; skipped during graph rebuild"
+                ),
             }
         }
 

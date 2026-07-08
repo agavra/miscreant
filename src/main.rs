@@ -59,6 +59,15 @@ async fn main() -> anyhow::Result<()> {
 /// Bind the configured address and serve the git HTTP(S) protocol until
 /// shutdown.
 async fn serve(config: Config) -> anyhow::Result<()> {
+    tracing::info!(
+        storage_url = %redact_storage_url(&config.storage_url),
+        bind_addr = %config.bind_addr,
+        inline_threshold = config.inline_threshold,
+        auto_create_repos = config.auto_create_repos,
+        staging_root = %config.staging_root.display(),
+        "starting"
+    );
+
     reset_staging_root(&config.staging_root)
         .await
         .with_context(|| {
@@ -106,6 +115,26 @@ async fn rebuild_graph(config: Config, repo: &str) -> anyhow::Result<()> {
         .context("failed to rebuild commit graph")?;
     println!("rebuilt {count} commit-graph record(s) for repository {repo:?}");
     Ok(())
+}
+
+/// Strip any credentials from a storage URL before it is logged. A storage
+/// URL may one day carry a secret in its userinfo (e.g. `s3://key:secret@…`);
+/// the username and password are removed so the startup event never records
+/// them. A value that does not parse as a URL is logged verbatim (it has no
+/// userinfo to leak).
+fn redact_storage_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return raw.to_owned();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return url.to_string();
+    }
+    // If either setter refuses (a URL that cannot hold userinfo), fall back to
+    // the scheme alone rather than risk emitting the credentials.
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return format!("{}://<redacted>", url.scheme());
+    }
+    url.to_string()
 }
 
 /// Delete and recreate the staging root. Pack staging is request-scoped, so

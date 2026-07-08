@@ -185,12 +185,14 @@ pub async fn ingest_pack(
     // store failure surfaces immediately with its real cause; a base that
     // simply isn't there is omitted — gix decides later whether that makes
     // the pack invalid.
-    let mut bases = HashMap::with_capacity(spooled.ref_delta_bases.len());
+    let ref_delta_bases = spooled.ref_delta_bases.len();
+    let mut bases = HashMap::with_capacity(ref_delta_bases);
     for base_id in spooled.ref_delta_bases {
         if let Some(object) = objectdb.get(repo.id, &base_id).await? {
             bases.insert(base_id, object);
         }
     }
+    let bases_prefetched = bases.len();
 
     let tempdir = spooled.tempdir;
     let (tempdir, bundle) = tokio::task::spawn_blocking(move || {
@@ -199,10 +201,17 @@ pub async fn ingest_pack(
     })
     .await?;
 
-    Ok(StagedPack {
+    let staged = StagedPack {
         _tempdir: tempdir,
         bundle: bundle?,
-    })
+    };
+    tracing::debug!(
+        objects = staged.object_count(),
+        ref_delta_bases,
+        bases_prefetched,
+        "pack ingested"
+    );
+    Ok(staged)
 }
 
 /// The spooled pack file plus the ref-delta base ids found while scanning

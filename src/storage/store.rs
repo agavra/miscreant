@@ -318,13 +318,17 @@ impl Store {
 
             match txn.commit().await {
                 Ok(_) => {
+                    tracing::info!(repo = %name, repo_id = id.0, "repository created");
                     return Ok(RepoMeta {
                         id,
                         object_format: Kind::Sha1,
                         default_branch: DEFAULT_BRANCH.to_owned(),
                     });
                 }
-                Err(e) if is_conflict(&e) => continue,
+                Err(e) if is_conflict(&e) => {
+                    tracing::debug!(repo = %name, "repository create conflict; retrying");
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -519,6 +523,11 @@ impl Store {
                 Err(e) if is_conflict(&e) => {
                     attempt += 1;
                     if attempt >= UPDATE_REFS_ATTEMPTS {
+                        tracing::warn!(
+                            repo = repo.0,
+                            attempts = attempt,
+                            "ref compare-and-swap retry budget exhausted"
+                        );
                         return Ok(updates
                             .iter()
                             .map(|u| RefUpdateResult {
@@ -527,6 +536,11 @@ impl Store {
                             })
                             .collect());
                     }
+                    tracing::debug!(
+                        repo = repo.0,
+                        attempt,
+                        "ref compare-and-swap conflict; retrying"
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }

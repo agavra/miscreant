@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -32,6 +33,7 @@ use gix_hash::ObjectId;
 use gix_object::{Kind, TagRef};
 use gix_packetline_blocking::{Channel, PacketLineRef, decode, encode};
 use tokio::sync::mpsc;
+use tracing::{Instrument, Span};
 
 use crate::AppState;
 use crate::error::{self, Class, Classify};
@@ -77,12 +79,14 @@ pub async fn upload_pack(
 ) -> Response {
     // Only protocol v2 is served; the advertisement requires the same header.
     if !http::wants_v2(headers) {
+        tracing::debug!("missing protocol v2 header");
         return version_error();
     }
 
     let request = match parse_request(&body) {
         Ok(request) => request,
         Err(ParseError) => {
+            tracing::debug!("malformed upload-pack request");
             return http::plain(StatusCode::BAD_REQUEST, "malformed upload-pack request");
         }
     };
@@ -122,8 +126,11 @@ fn version_error() -> Response {
 }
 
 /// An in-band protocol rejection: a single `ERR` pkt-line the client surfaces
-/// as a fatal error, carried in an otherwise-successful result response.
+/// as a fatal error, carried in an otherwise-successful result response. Every
+/// client-caused upload-pack rejection funnels through here, so one debug event
+/// records the reason for the whole endpoint.
 fn err_line(message: &str) -> Response {
+    tracing::debug!(reason = %message, "request rejected");
     match advertise::error_line(message) {
         Ok(body) => http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body),
         Err(_) => http::internal_error(),
@@ -148,6 +155,7 @@ fn error_response<E: Classify + std::error::Error>(err: &E) -> Response {
 /// through the same classifier `ls-refs` uses; once streaming has begun, a
 /// failure can only be reported on side-band channel 3.
 async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
+    let start = Instant::now();
     let parsed = match FetchArgs::parse(args) {
         Ok(parsed) => parsed,
         Err(message) => return err_line(&message),
@@ -165,6 +173,17 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
         return err_line("too many objects for one pack");
     };
 
+    // The read-path story for one fetch. Timed to the point the pack is
+    // planned and streaming begins; the pack bytes flow out after this.
+    tracing::debug!(
+        wants = parsed.wants.len(),
+        haves = parsed.haves.len(),
+        common = common.len(),
+        objects_packed = count,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "fetch planned"
+    );
+
     let prefix = match negotiation_prefix(parsed.done, &common) {
         Ok(prefix) => prefix,
         Err(_) => return http::internal_error(),
@@ -172,19 +191,21 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
 
     // Look up object contents concurrently (up to OBJECT_LOOKAHEAD in
     // flight), hand them in collected order to the blocking pack writer,
-    // and stream its side-band packets out as the response body.
+    // and stream its side-band packets out as the response body. Both the
+    // spawned lookup task and the blocking writer carry the request span so
+    // any events they emit inherit the repo/endpoint context.
+    let span = Span::current();
     let (object_tx, object_rx) = mpsc::channel(OBJECT_LOOKAHEAD);
-    tokio::spawn(feed_objects(
-        state.objectdb.clone(),
-        meta.id,
-        collected,
-        object_tx,
-    ));
+    tokio::spawn(
+        feed_objects(state.objectdb.clone(), meta.id, collected, object_tx)
+            .instrument(span.clone()),
+    );
 
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_PACKETS);
     let object_hash = meta.object_format;
     let no_progress = parsed.no_progress;
     tokio::task::spawn_blocking(move || {
+        let _guard = span.enter();
         stream_pack(object_rx, body_tx, count, object_hash, no_progress);
     });
 
@@ -554,6 +575,7 @@ async fn build_ls_refs(
 ) -> Result<Vec<u8>, LsRefsError> {
     let refs = gather_refs(&state.store, repo, &args.prefixes).await?;
     let mut body = Vec::new();
+    let mut advertised = 0usize;
     for (name, target) in refs {
         let oid = match resolve_ref(&state.store, repo, &target).await? {
             Resolution::Resolved(oid) => oid,
@@ -570,12 +592,26 @@ async fn build_ls_refs(
                     }
                     line.push('\n');
                     encode::data_to_write(line.as_bytes(), &mut body)?;
+                    advertised += 1;
+                } else {
+                    tracing::warn!(
+                        reference = %name,
+                        reason = "dangling",
+                        "symref routed around during advertisement"
+                    );
                 }
                 continue;
             }
             // A chain exceeding the depth cap has no reliable target to
             // report and is omitted outright.
-            Resolution::TooDeep => continue,
+            Resolution::TooDeep => {
+                tracing::warn!(
+                    reference = %name,
+                    reason = "too-deep",
+                    "symref routed around during advertisement"
+                );
+                continue;
+            }
         };
         let mut line = format!("{} {name}", oid.to_hex());
         if args.symrefs
@@ -590,8 +626,10 @@ async fn build_ls_refs(
         }
         line.push('\n');
         encode::data_to_write(line.as_bytes(), &mut body)?;
+        advertised += 1;
     }
     encode::flush_to_write(&mut body)?;
+    tracing::debug!(refs = advertised, "ls-refs served");
     Ok(body)
 }
 

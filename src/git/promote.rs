@@ -132,6 +132,7 @@ pub async fn validate_and_promote(
             Kind::Tag => tags.push((oid, body)),
         }
     }
+    let (blob_count, tree_count, tag_count) = (blobs.len(), trees.len(), tags.len());
 
     // Phase 2: promote objects children-before-parents. Blobs depend on
     // nothing, trees on blobs and subtrees, commits on their root tree and
@@ -214,6 +215,15 @@ pub async fn validate_and_promote(
     // transaction) is the last write in the sequence, so a recovered state
     // that contains a ref necessarily contains that ref's entire closure.
     store.flush().await?;
+
+    tracing::debug!(
+        blobs = blob_count,
+        trees = tree_count,
+        commits = commits.len(),
+        tags = tag_count,
+        graph_records = promotion.commits.len(),
+        "promotion complete"
+    );
 
     Ok(promotion)
 }

@@ -9,6 +9,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use tracing::Instrument;
 
 use crate::AppState;
 use crate::protocol::{advertise, receive_pack, upload_pack};
@@ -46,8 +47,16 @@ pub async fn info_refs(
     };
 
     match service_param(query.as_deref()).as_deref() {
-        Some(SERVICE_UPLOAD_PACK) => upload_pack_advert(&state, &repo, &headers).await,
-        Some(SERVICE_RECEIVE_PACK) => receive_pack_advert(&state, &repo).await,
+        Some(SERVICE_UPLOAD_PACK) => {
+            let span = tracing::debug_span!("advertise", repo = %repo, endpoint = "info/refs");
+            upload_pack_advert(&state, &repo, &headers)
+                .instrument(span)
+                .await
+        }
+        Some(SERVICE_RECEIVE_PACK) => {
+            let span = tracing::debug_span!("advertise", repo = %repo, endpoint = "info/refs");
+            receive_pack_advert(&state, &repo).instrument(span).await
+        }
         _ => plain(
             StatusCode::BAD_REQUEST,
             "missing or unsupported service parameter",
@@ -69,13 +78,19 @@ pub async fn git_rpc(
             Ok(name) => name,
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
-        receive_pack::receive_pack(&state, &repo, body).await
+        let span = tracing::debug_span!("receive_pack", repo = %repo, endpoint = "receive-pack");
+        receive_pack::receive_pack(&state, &repo, body)
+            .instrument(span)
+            .await
     } else if let Some(prefix) = strip_endpoint(&path, UPLOAD_PACK) {
         let repo = match repo_name(prefix) {
             Ok(name) => name,
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
-        upload_pack::upload_pack(&state, &repo, &headers, body).await
+        let span = tracing::debug_span!("upload_pack", repo = %repo, endpoint = "upload-pack");
+        upload_pack::upload_pack(&state, &repo, &headers, body)
+            .instrument(span)
+            .await
     } else {
         plain(StatusCode::NOT_FOUND, "not found")
     }

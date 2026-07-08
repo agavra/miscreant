@@ -12,6 +12,7 @@
 //! 200 even when refs are rejected. Only malformed request framing is a 4xx.
 
 use std::io;
+use std::time::Instant;
 
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -36,9 +37,12 @@ const NG_UNPACKER_ERROR: &str = "unpacker error";
 /// Serve a `POST /<repo>/git-receive-pack` request. `repo` is the already
 /// validated repository name.
 pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response {
+    let start = Instant::now();
+    let pack_bytes = body.len();
     let request = match parse_request(&body) {
         Ok(request) => request,
         Err(ParseError) => {
+            tracing::debug!("malformed receive-pack request");
             return http::plain(StatusCode::BAD_REQUEST, "malformed receive-pack request");
         }
     };
@@ -67,11 +71,11 @@ pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response
     // Validate connectivity and promote the new objects, with the non-delete
     // new-oids as the reachability tips.
     let tips: Vec<ObjectId> = request.commands.iter().filter_map(|cmd| cmd.new).collect();
-    if let Err(err) =
-        validate_and_promote(&staged, &tips, &state.objectdb, &state.store, meta.id).await
-    {
-        return push_failed(&request, error::classify(&err));
-    }
+    let promotion =
+        match validate_and_promote(&staged, &tips, &state.objectdb, &state.store, meta.id).await {
+            Ok(promotion) => promotion,
+            Err(err) => return push_failed(&request, error::classify(&err)),
+        };
 
     // Apply the ref updates as compare-and-swap.
     let updates: Vec<RefUpdate> = request
@@ -92,6 +96,22 @@ pub async fn receive_pack(state: &AppState, repo: &str, body: Bytes) -> Response
             return http::internal_error();
         }
     };
+
+    // One summary event per push (also an audit line): the ref outcomes, the
+    // count of objects promoted, the pack size, and how long it took.
+    let accepted = results
+        .iter()
+        .filter(|result| matches!(result.outcome, RefOutcome::Updated))
+        .count();
+    tracing::info!(
+        repo = %repo,
+        refs_accepted = accepted,
+        refs_rejected = results.len() - accepted,
+        objects_promoted = promotion.promoted.len(),
+        pack_bytes,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "push accepted"
+    );
 
     report_success(&request, &results)
 }
@@ -117,6 +137,7 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Result<Option<RepoMeta>, 
 fn push_failed(request: &Request, class: Class) -> Response {
     match class {
         Class::Client(reason) => {
+            tracing::debug!(reason = %reason, "push rejected");
             let statuses = request
                 .commands
                 .iter()
@@ -142,7 +163,10 @@ fn report_success(request: &Request, results: &[RefUpdateResult]) -> Response {
         .map(|result| {
             let status = match &result.outcome {
                 RefOutcome::Updated => RefStatus::Ok,
-                RefOutcome::Rejected(reason) => RefStatus::Ng(reason.clone()),
+                RefOutcome::Rejected(reason) => {
+                    tracing::debug!(reference = %result.name, reason = %reason, "ref rejected");
+                    RefStatus::Ng(reason.clone())
+                }
             };
             (result.name.clone(), status)
         })

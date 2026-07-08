@@ -5,8 +5,12 @@ pub mod protocol;
 pub mod storage;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
+use axum::extract::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 
 pub use crate::config::Config;
@@ -48,7 +52,29 @@ pub fn app(state: AppState) -> Router {
             "/{*path}",
             get(protocol::http::info_refs).post(protocol::http::git_rpc),
         )
+        .layer(middleware::from_fn(access_log))
         .with_state(state)
+}
+
+/// One access-log event per request under the dedicated `"access"` target so
+/// operators enable it in isolation (`RUST_LOG=info,access=debug`) without
+/// turning on module debug noise. `elapsed_to_start_ms` measures until the
+/// handler returns the response head; a streamed body (a fetch pack) is still
+/// being sent after this fires.
+async fn access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let start = Instant::now();
+    let response = next.run(request).await;
+    tracing::debug!(
+        target: "access",
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        elapsed_to_start_ms = start.elapsed().as_millis() as u64,
+        "request"
+    );
+    response
 }
 
 async fn healthz() -> &'static str {
