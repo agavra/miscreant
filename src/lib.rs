@@ -10,24 +10,29 @@ use axum::Router;
 use axum::routing::get;
 
 pub use crate::config::Config;
-use crate::storage::{Store, StoreError};
+use crate::storage::{BlobStore, ObjectDb, Store, StoreError};
 
 /// Shared state handed to every request handler.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
+    pub objectdb: ObjectDb,
 }
 
 impl AppState {
     /// Build application state, opening the store backing `config.storage_url`
-    /// (relative `file` URLs are resolved to absolute paths first).
+    /// (relative `file` URLs are resolved to absolute paths first). The object
+    /// database layers blob offload over the store's root object store.
     pub async fn new(config: Config) -> Result<Self, StoreError> {
         let storage_url = config::normalize_storage_url(&config.storage_url)?;
         let store = Store::open(&storage_url).await?;
+        let blobs = BlobStore::new(store.object_store());
+        let objectdb = ObjectDb::new(store.clone(), blobs, config.inline_threshold);
         Ok(Self {
             config: Arc::new(config),
             store,
+            objectdb,
         })
     }
 }

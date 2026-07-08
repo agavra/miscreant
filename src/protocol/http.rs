@@ -2,15 +2,17 @@
 //!
 //! See `docs/0001-init.md` §Transfer Protocol (path scheme, v2-only fetch),
 //! §Fetch API (capability list), and §Receive API (discovery). Repositories
-//! are addressed by the request path minus the endpoint suffix; the pack RPC
-//! endpoints are stubbed until the receive/fetch flows land.
+//! are addressed by the request path minus the endpoint suffix. The push RPC
+//! is served by `receive_pack`; the fetch RPC is stubbed until upload-pack
+//! lands.
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 
 use crate::AppState;
-use crate::protocol::advertise;
+use crate::protocol::{advertise, receive_pack};
 
 /// Endpoint suffix for a ref-advertisement request.
 const INFO_REFS: &str = "info/refs";
@@ -56,12 +58,21 @@ pub async fn info_refs(
 
 /// `POST /<repo>/git-upload-pack` and `POST /<repo>/git-receive-pack`.
 ///
-/// Pack negotiation is not implemented yet; the advertisement endpoints are
-/// fully functional, so a real client completes discovery and then reaches
-/// this stub when it tries to exchange packs.
-pub async fn git_rpc(Path(path): Path<String>) -> Response {
-    if strip_endpoint(&path, UPLOAD_PACK).is_some() || strip_endpoint(&path, RECEIVE_PACK).is_some()
-    {
+/// Receive-pack (push) is served here; upload-pack (fetch negotiation) is not
+/// implemented yet, so a client that completes discovery and then tries to
+/// fetch reaches its stub.
+pub async fn git_rpc(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Some(prefix) = strip_endpoint(&path, RECEIVE_PACK) {
+        let repo = match repo_name(prefix) {
+            Ok(name) => name,
+            Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
+        };
+        receive_pack::receive_pack(&state, &repo, body).await
+    } else if strip_endpoint(&path, UPLOAD_PACK).is_some() {
         plain(StatusCode::NOT_IMPLEMENTED, "not implemented")
     } else {
         plain(StatusCode::NOT_FOUND, "not found")
@@ -178,7 +189,11 @@ fn wants_v2(headers: &HeaderMap) -> bool {
 }
 
 /// Build a git response with the mandatory `Cache-Control: no-cache` header.
-fn git_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
+pub(crate) fn git_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
     (
         status,
         [
@@ -191,7 +206,7 @@ fn git_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -
 }
 
 /// A short `text/plain` git response (errors, stubs).
-fn plain(status: StatusCode, message: &str) -> Response {
+pub(crate) fn plain(status: StatusCode, message: &str) -> Response {
     git_response(
         status,
         "text/plain; charset=utf-8",
@@ -200,7 +215,7 @@ fn plain(status: StatusCode, message: &str) -> Response {
 }
 
 /// A generic 500 for unexpected storage failures.
-fn internal_error() -> Response {
+pub(crate) fn internal_error() -> Response {
     plain(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 

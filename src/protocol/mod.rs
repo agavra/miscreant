@@ -2,7 +2,8 @@
 //!
 //! See `docs/0001-init.md` §Transfer Protocol, §Fetch API, and §Receive API.
 //! `http` owns routing and repository resolution; `advertise` builds the
-//! pkt-line service advertisements.
+//! pkt-line service advertisements; `receive_pack` serves the push RPC.
 
 pub mod advertise;
 pub mod http;
+pub mod receive_pack;

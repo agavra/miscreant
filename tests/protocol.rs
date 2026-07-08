@@ -237,21 +237,19 @@ async fn should_route_git_suffix_and_nested_names_to_the_same_repo() {
 }
 
 #[tokio::test]
-async fn should_return_501_for_stubbed_pack_rpc_endpoints() {
+async fn should_return_501_for_the_stubbed_upload_pack_rpc_endpoint() {
     // given
     let server = TestServer::spawn(test_config()).await;
 
-    // when/then: both pack RPC endpoints are stubbed for now.
-    for endpoint in ["git-upload-pack", "git-receive-pack"] {
-        let response = reqwest::Client::new()
-            .post(format!("{}/some/repo/{endpoint}", server.base_url()))
-            .body("")
-            .send()
-            .await
-            .expect("send request");
-        assert_eq!(response.status(), 501);
-        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
-    }
+    // when/then: fetch negotiation is still stubbed (push is served).
+    let response = reqwest::Client::new()
+        .post(format!("{}/some/repo/git-upload-pack", server.base_url()))
+        .body("")
+        .send()
+        .await
+        .expect("send request");
+    assert_eq!(response.status(), 501);
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
 }
 
 // The in-process server and the blocking `git` subprocess must run

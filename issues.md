@@ -21,6 +21,19 @@ Miscreant. See `docs/0001-init.md` for the design.
   REF_DELTA for genuine thin-pack (out-of-pack) bases — but a client that does
   not support `ofs-delta` could produce packs we cannot ingest.
 
+## Receive / push
+
+- **Ref updates enforce compare-and-swap only, not a fast-forward/force
+  policy.** `git-receive-pack` applies each command as a CAS on the claimed
+  old-oid (per the design), so it rejects a command only when the ref no
+  longer holds the value the client sent (`ng <ref> non-fast-forward`). It
+  performs no ancestry check of its own: a client that sends the current tip
+  as old-oid with a new-oid that is not its descendant overwrites the ref, the
+  same as a force push. The git CLI never does this unintentionally (it
+  reconciles against the advertisement and refuses non-fast-forwards unless
+  forced), but server-side force control belongs with the deferred
+  authentication/authorization work.
+
 ## Promotion
 
 - **Tag objects are promoted last, after commits (not between trees and
