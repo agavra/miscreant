@@ -81,8 +81,10 @@ const CREATE_ATTEMPTS: usize = 32;
 /// which every command is failed as `ng` (design: non-atomic ref updates).
 const UPDATE_REFS_ATTEMPTS: usize = 2;
 
-/// Rejection reason when a ref's current value does not match `expected_old`.
-const REASON_STALE: &str = "stale info";
+/// Rejection reason when a ref's current value does not match `expected_old`:
+/// the ref moved under the client, so its update is not a fast-forward of the
+/// value the push claimed. Phrased the way git clients render a rejected ref.
+const REASON_NON_FAST_FORWARD: &str = "non-fast-forward";
 /// Rejection reason when a command targets a symbolic ref (e.g. `HEAD`).
 const REASON_SYMBOLIC: &str = "cannot update symbolic ref";
 /// Rejection reason when the CAS transaction could not commit.
@@ -497,7 +499,7 @@ impl Store {
                 if current != update.expected_old {
                     results.push(RefUpdateResult {
                         name: update.name.clone(),
-                        outcome: RefOutcome::Rejected(REASON_STALE.to_owned()),
+                        outcome: RefOutcome::Rejected(REASON_NON_FAST_FORWARD.to_owned()),
                     });
                     continue;
                 }
@@ -954,7 +956,7 @@ mod tests {
         // then
         assert_eq!(
             results[0].outcome,
-            RefOutcome::Rejected(REASON_STALE.to_owned())
+            RefOutcome::Rejected(REASON_NON_FAST_FORWARD.to_owned())
         );
         // Ref is unchanged.
         assert_eq!(
@@ -989,7 +991,7 @@ mod tests {
         // then
         assert_eq!(
             results[0].outcome,
-            RefOutcome::Rejected(REASON_STALE.to_owned())
+            RefOutcome::Rejected(REASON_NON_FAST_FORWARD.to_owned())
         );
     }
 
@@ -1029,7 +1031,7 @@ mod tests {
         assert_eq!(results[0].outcome, RefOutcome::Updated);
         assert_eq!(
             results[1].outcome,
-            RefOutcome::Rejected(REASON_STALE.to_owned())
+            RefOutcome::Rejected(REASON_NON_FAST_FORWARD.to_owned())
         );
         // The valid command committed even though a sibling was rejected.
         assert_eq!(
