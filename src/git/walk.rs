@@ -7,7 +7,8 @@
 //! soon as every want has been resolved (emitted or downgraded to HAVE).
 //! Commit metadata (generation, root tree, parents) comes from the
 //! commit-graph segment, which is rebuilt lazily from the objects themselves
-//! whenever records are missing.
+//! whenever records are missing ([`Walker::get_commit_info`]), or wholesale
+//! for a whole repository ([`Walker::rebuild_commit_graph`]).
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -15,8 +16,18 @@ use gix_hash::{ObjectId, oid};
 use gix_object::{CommitRef, Kind, TagRef, TreeRefIter};
 
 use crate::storage::keys::RepoId;
-use crate::storage::values::CommitGraphRecord;
+use crate::storage::values::{CommitGraphRecord, RefTarget};
 use crate::storage::{Durability, ObjectDb, ObjectDbError, Store, StoreError};
+
+/// Upper bound on symref indirection when resolving a ref to a direct object
+/// id during [`Walker::rebuild_commit_graph`]. A chain that dangles or does
+/// not terminate within this many hops contributes no root commit.
+const MAX_REBUILD_SYMREF_DEPTH: usize = 5;
+
+/// Upper bound on annotated-tag indirection when peeling a resolved ref
+/// object down to a commit during [`Walker::rebuild_commit_graph`]. A chain
+/// that does not terminate within this many hops contributes no root commit.
+const MAX_REBUILD_TAG_PEEL_DEPTH: usize = 5;
 
 /// Errors surfaced by the fetch walk.
 #[derive(Debug, thiserror::Error)]
@@ -291,6 +302,141 @@ impl Walker {
             history,
             direct: direct.into_vec(),
         })
+    }
+
+    /// Bulk-recompute the commit-graph record for every commit reachable
+    /// from this repository's refs, overwriting whatever was already
+    /// stored. This differs from [`Walker::get_commit_info`]'s lazy
+    /// backfill in the one way that matters for a rebuild: backfill stops
+    /// as soon as it reaches a commit that already has a record, so it can
+    /// only fill gaps, whereas a rebuild never trusts an existing record —
+    /// every generation is recomputed from the commit objects themselves,
+    /// so a rebuild also corrects a record that had gone stale or been
+    /// corrupted.
+    ///
+    /// Refs are resolved to a root commit by following symref chains and
+    /// peeling annotated tag chains through the object database; a ref that
+    /// does not ultimately name a commit (dangling, too deep, or pointing
+    /// at a tree or blob) contributes no root and is silently skipped. The
+    /// full closure of every root is then walked once with an iterative
+    /// post-order pass shared across all roots, so a commit reachable from
+    /// more than one ref is only computed once. Every write uses
+    /// [`Durability::Relaxed`]; a single [`Store::flush`] at the end makes
+    /// a completed rebuild durable, mirroring the barrier promotion uses.
+    ///
+    /// Returns the number of commit-graph records written.
+    pub async fn rebuild_commit_graph(&self) -> Result<usize, WalkError> {
+        let refs = self.store.list_refs(self.repo, None).await?;
+        let mut roots = Vec::new();
+        for (_, target) in refs {
+            if let Some(commit_id) = self.resolve_commit_tip(target).await? {
+                roots.push(commit_id);
+            }
+        }
+
+        // Parsed commit bodies and resolved generations for this rebuild
+        // only — neither is seeded from (or ever consults) existing
+        // commit-graph records, since recomputing from the commit objects
+        // is the whole point of a rebuild.
+        let mut parsed: HashMap<ObjectId, (ObjectId, Vec<ObjectId>)> = HashMap::new();
+        let mut generations: HashMap<ObjectId, u32> = HashMap::new();
+
+        for root in roots {
+            if generations.contains_key(&root) {
+                continue;
+            }
+            let mut stack = vec![root];
+            while let Some(&top) = stack.last() {
+                if generations.contains_key(&top) {
+                    stack.pop();
+                    continue;
+                }
+                let (root_tree, parents) = match parsed.get(&top) {
+                    Some(entry) => entry.clone(),
+                    None => {
+                        let entry = self.parse_commit(&top).await?;
+                        parsed.insert(top, entry.clone());
+                        entry
+                    }
+                };
+                let missing: Vec<ObjectId> = parents
+                    .iter()
+                    .filter(|parent| !generations.contains_key(*parent))
+                    .copied()
+                    .collect();
+                if missing.is_empty() {
+                    let generation = 1 + parents
+                        .iter()
+                        .filter_map(|parent| generations.get(parent))
+                        .max()
+                        .copied()
+                        .unwrap_or(0);
+                    let record = CommitGraphRecord {
+                        generation,
+                        root_tree,
+                        parents,
+                    };
+                    self.store
+                        .put_commit_graph(self.repo, &top, &record, Durability::Relaxed)
+                        .await?;
+                    generations.insert(top, generation);
+                    stack.pop();
+                } else {
+                    stack.extend(missing);
+                }
+            }
+        }
+
+        self.store.flush().await?;
+        Ok(generations.len())
+    }
+
+    /// Resolve one ref's target to a root commit for
+    /// [`Walker::rebuild_commit_graph`]: follow symref chains to a direct
+    /// object id, then peel annotated tag chains through the object
+    /// database until a non-tag object is reached. Returns `None` for
+    /// anything that does not bottom out at a commit — a dangling or
+    /// too-deep symref chain, a target object gone missing, or a chain that
+    /// peels to a tree or blob — so a rebuild routes around a broken ref
+    /// instead of failing the whole repository's graph.
+    async fn resolve_commit_tip(&self, target: RefTarget) -> Result<Option<ObjectId>, WalkError> {
+        let mut current = target;
+        let mut resolved = None;
+        for _ in 0..MAX_REBUILD_SYMREF_DEPTH {
+            match current {
+                RefTarget::Direct(id) => {
+                    resolved = Some(id);
+                    break;
+                }
+                RefTarget::Reference(name) => match self.store.get_ref(self.repo, &name).await? {
+                    Some(next) => current = next,
+                    None => return Ok(None), // dangling symref
+                },
+            }
+        }
+        let Some(mut cursor) = resolved else {
+            return Ok(None); // symref chain exceeded the depth cap
+        };
+
+        for _ in 0..MAX_REBUILD_TAG_PEEL_DEPTH {
+            let Some((kind, body)) = self.objects.get(self.repo, &cursor).await? else {
+                return Ok(None); // target object does not exist
+            };
+            match kind {
+                Kind::Commit => return Ok(Some(cursor)),
+                Kind::Tag => {
+                    let tag = TagRef::from_bytes(&body, cursor.kind()).map_err(|source| {
+                        WalkError::Decode {
+                            oid: cursor,
+                            source,
+                        }
+                    })?;
+                    cursor = tag.target();
+                }
+                _ => return Ok(None), // tree or blob: not a commit
+            }
+        }
+        Ok(None) // tag chain exceeded the depth cap
     }
 
     /// Phase I: decide which commits to send. `wants` are ref tips requested
@@ -1505,5 +1651,129 @@ mod tests {
         // walk instead fetched its content, this would have failed with a
         // blob-store lookup error rather than returning successfully.
         assert_eq!(as_set(&collected), as_set(&[c, root, small]));
+    }
+
+    #[tokio::test]
+    async fn should_return_zero_records_when_every_ref_dangles() {
+        // given: a fresh repo, whose only ref (HEAD) symrefs to a branch
+        // that was never created.
+        let w = walker().await;
+
+        // when
+        let count = w.rebuild_commit_graph().await.expect("rebuild");
+
+        // then
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn should_rebuild_records_for_every_commit_reachable_from_refs() {
+        // given: a linear chain named by refs/heads/main (HEAD symrefs to it).
+        let w = walker().await;
+        let commits = chain(&w, 3).await;
+        w.store
+            .put_ref(w.repo, "refs/heads/main", &RefTarget::Direct(commits[2]))
+            .await
+            .expect("put main");
+
+        // when
+        let count = w.rebuild_commit_graph().await.expect("rebuild");
+
+        // then: exactly the three-commit chain got fresh records, with the
+        // expected generations.
+        assert_eq!(count, 3);
+        for (i, id) in commits.iter().enumerate() {
+            let record = w
+                .store
+                .get_commit_graph(w.repo, id)
+                .await
+                .expect("get graph")
+                .expect("record written");
+            assert_eq!(record.generation, (i + 1) as u32);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_root_an_annotated_tag_ref_at_its_target_commit() {
+        // given: a tag ref pointing at an annotated tag object over a commit.
+        let w = walker().await;
+        let commits = chain(&w, 1).await;
+        let t = tag(&w, commits[0], Kind::Commit, "v1").await;
+        w.store
+            .put_ref(w.repo, "refs/tags/v1", &RefTarget::Direct(t))
+            .await
+            .expect("put tag ref");
+
+        // when
+        let count = w.rebuild_commit_graph().await.expect("rebuild");
+
+        // then: the tag object itself is not a commit-graph root; only the
+        // commit it points at gets a record.
+        assert_eq!(count, 1);
+        assert!(
+            w.store
+                .get_commit_graph(w.repo, &commits[0])
+                .await
+                .expect("get graph")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_skip_a_ref_whose_target_is_not_a_commit() {
+        // given: a ref pointing directly at a blob.
+        let w = walker().await;
+        let b = blob(&w, b"not a commit").await;
+        w.store
+            .put_ref(w.repo, "refs/heads/broken", &RefTarget::Direct(b))
+            .await
+            .expect("put broken ref");
+
+        // when
+        let count = w.rebuild_commit_graph().await.expect("rebuild");
+
+        // then: no commit-graph record is produced for the non-commit ref.
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn should_recompute_a_record_even_when_a_different_value_is_already_stored() {
+        // given: a root commit whose stored generation (42) disagrees with
+        // the value implied by its actual (empty) parent list. Lazy backfill
+        // via `get_commit_info` would trust this record and never touch it;
+        // a rebuild must not.
+        let w = walker().await;
+        let commits = chain(&w, 2).await;
+        w.store
+            .put_ref(w.repo, "refs/heads/main", &RefTarget::Direct(commits[1]))
+            .await
+            .expect("put main");
+        let root_tree = w.parse_commit(&commits[0]).await.expect("parse").0;
+        w.store
+            .put_commit_graph(
+                w.repo,
+                &commits[0],
+                &CommitGraphRecord {
+                    generation: 42,
+                    root_tree,
+                    parents: vec![],
+                },
+                Durability::Durable,
+            )
+            .await
+            .expect("seed stale record");
+
+        // when
+        w.rebuild_commit_graph().await.expect("rebuild");
+
+        // then: the rebuild overwrote the stale generation with the value
+        // recomputed from the commit object (a root has generation 1).
+        let record = w
+            .store
+            .get_commit_graph(w.repo, &commits[0])
+            .await
+            .expect("get graph")
+            .expect("record written");
+        assert_eq!(record.generation, 1);
     }
 }

@@ -2,17 +2,15 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
-use clap::Parser;
+use clap::Args;
 use url::Url;
 
 /// Server configuration, populated from CLI flags and `MISCREANT_*`
-/// environment variables.
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "miscreant",
-    version,
-    about = "a git server backed by object storage"
-)]
+/// environment variables. Flattened into every subcommand of the top-level
+/// CLI (see `main.rs`), so both `serve` and `rebuild-graph` share the same
+/// storage flags/env; some fields (e.g. `bind_addr`) are meaningful only to
+/// `serve`.
+#[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Address the HTTP server listens on.
     #[arg(long, env = "MISCREANT_BIND_ADDR", default_value_t = default_bind_addr())]

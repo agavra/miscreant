@@ -592,6 +592,27 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    /// Delete every commit-graph record for `repo`, simulating a wiped
+    /// commit-graph segment so tests can exercise recovery (lazy backfill or
+    /// a bulk rebuild) from scratch. Not `#[cfg(test)]`: integration tests
+    /// under `tests/` link this crate without `--cfg test`, so a
+    /// `cfg(test)`-gated item would be invisible to them. `#[doc(hidden)]`
+    /// instead keeps this out of the published API surface while remaining
+    /// reachable from any caller that links the crate, test or otherwise.
+    #[doc(hidden)]
+    pub async fn wipe_commit_graph_for_test(&self, repo: RepoId) -> Result<(), StoreError> {
+        let prefix = keys::segment_prefix(repo, Segment::CommitGraph);
+        let mut iter = self.db.scan_prefix(prefix, ..).await?;
+        let mut doomed = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            doomed.push(kv.key);
+        }
+        for key in doomed {
+            self.db.delete(key).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the storage URL into a root object store already offset by the
@@ -1158,6 +1179,46 @@ mod tests {
                 .expect("get graph"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn should_wipe_only_the_commit_graph_segment_for_the_test_helper() {
+        // given: a commit-graph record and an object record for the same repo.
+        let store = memory_store().await;
+        let repo = store.create_repo("wipe").await.expect("create").id;
+        let commit = oid(b'a');
+        let graph = CommitGraphRecord {
+            generation: 1,
+            root_tree: oid(b'b'),
+            parents: vec![],
+        };
+        store
+            .put_commit_graph(repo, &commit, &graph, Durability::Durable)
+            .await
+            .expect("put graph");
+        let blob_oid = oid(b'c');
+        store
+            .put_object(
+                repo,
+                &blob_oid,
+                &ObjectRecord::BlobInline(Bytes::from_static(b"blob 1\0x")),
+                Durability::Durable,
+            )
+            .await
+            .expect("put object");
+
+        // when
+        store
+            .wipe_commit_graph_for_test(repo)
+            .await
+            .expect("wipe commit graph");
+
+        // then: only the commit-graph record is gone; the object survives.
+        assert_eq!(
+            store.get_commit_graph(repo, &commit).await.expect("get"),
+            None
+        );
+        assert!(store.object_exists(repo, &blob_oid).await.expect("exists"));
     }
 
     #[tokio::test]
