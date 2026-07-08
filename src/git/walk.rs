@@ -3,15 +3,25 @@
 //!
 //! See `docs/0001-init.md` §command=fetch. The walk preserves that section's
 //! invariants: a HAVE always dominates a WANT, a have's entire ancestry is
-//! HAVE, traversal pops the highest generation first, and discovery stops as
+//! HAVE, traversal visits the highest generation first, and discovery stops as
 //! soon as every want has been resolved (emitted or downgraded to HAVE).
 //! Commit metadata (generation, root tree, parents) comes from the
 //! commit-graph segment, which is rebuilt lazily from the objects themselves
 //! whenever records are missing ([`Walker::get_commit_info`]), or wholesale
 //! for a whole repository ([`Walker::rebuild_commit_graph`]).
+//!
+//! Both phases traverse level by level rather than one object at a time. Every
+//! store lookup is a point read whose latency is dominated by round-trip time,
+//! so the walk trades serial depth for fan-out width: it gathers a whole level
+//! of ids (a commit-graph generation, or a tree depth), issues their lookups as
+//! one bounded-width concurrent batch ([`WALK_LOOKAHEAD`]), then applies the
+//! results synchronously in a deterministic order. Serial depth collapses from
+//! the object count to the dependency depth, and the results are consumed in
+//! input order so the output stays fully deterministic.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use futures::stream::{self, StreamExt};
 use gix_hash::{ObjectId, oid};
 use gix_object::{CommitRef, Kind, TagRef, TreeRefIter};
 
@@ -28,6 +38,14 @@ const MAX_REBUILD_SYMREF_DEPTH: usize = 5;
 /// object down to a commit during [`Walker::rebuild_commit_graph`]. A chain
 /// that does not terminate within this many hops contributes no root commit.
 const MAX_REBUILD_TAG_PEEL_DEPTH: usize = 5;
+
+/// Number of store lookups the walk keeps in flight per level. Each level of
+/// commit-graph records, tree reads, or blob-size checks is fetched as one
+/// concurrent batch bounded to this width, and the results are consumed in
+/// input order so the walk stays deterministic. A little wider than the pack
+/// feeder's `OBJECT_LOOKAHEAD` (see `src/protocol/upload_pack.rs`): these are
+/// small point reads (records and sizes), not whole object bodies.
+const WALK_LOOKAHEAD: usize = 64;
 
 /// Errors surfaced by the fetch walk.
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +225,36 @@ struct Discovery {
     pending: HashSet<ObjectId>,
 }
 
+impl Discovery {
+    /// Mark `id` with `flag`, updating `pending` and pushing the commit onto
+    /// the frontier at `generation` when its state changed: a new WANT joins
+    /// `pending`, a WANT downgraded by a HAVE leaves it, and an established
+    /// HAVE absorbs everything. Both `pending` operations are idempotent, so
+    /// re-marking an id that already left (or never entered) the relevant
+    /// state is always safe. This is pure state mutation — the caller supplies
+    /// `generation` from a batch of record lookups, keeping I/O out of the
+    /// per-parent inner loop.
+    fn mark(&mut self, id: ObjectId, flag: Flag, generation: u32) {
+        let resolved = match (self.state.get(&id), flag) {
+            (Some(Flag::Have), _) | (Some(Flag::Want), Flag::Want) => return,
+            (Some(Flag::Want), Flag::Have) => {
+                self.pending.remove(&id);
+                Flag::Have
+            }
+            (None, Flag::Have) => Flag::Have,
+            (None, Flag::Want) => {
+                self.pending.insert(id);
+                Flag::Want
+            }
+        };
+        self.state.insert(id, resolved);
+        self.frontier.push(QueueEntry {
+            generation,
+            oid: id,
+        });
+    }
+}
+
 /// A tree entry relevant to the walk. Gitlink (submodule) entries reference
 /// objects that live in another repository and are skipped entirely.
 enum TreeEntry {
@@ -284,19 +332,17 @@ impl Walker {
     /// protocol error.
     ///
     /// Kinds are read via [`ObjectDb::size`], so no blob content is fetched
-    /// just to classify a want.
+    /// just to classify a want. Every want's kind is looked up as one
+    /// concurrent batch, then classified in want order so `history` keeps want
+    /// order and `direct` keeps first-seen order.
     pub async fn partition_wants(&self, wants: &[ObjectId]) -> Result<WantPartition, WalkError> {
         let mut history = Vec::new();
         let mut direct = OrderedOidSet::default();
-        for want in wants {
-            let (kind, _) = self
-                .objects
-                .size(self.repo, want)
-                .await?
-                .ok_or(WalkError::UnknownWant(*want))?;
+        for (want, size) in self.object_sizes(wants).await {
+            let (kind, _) = size?.ok_or(WalkError::UnknownWant(want))?;
             match kind {
-                Kind::Commit | Kind::Tag => history.push(*want),
-                Kind::Tree | Kind::Blob => direct.insert(*want),
+                Kind::Commit | Kind::Tag => history.push(want),
+                Kind::Tree | Kind::Blob => direct.insert(want),
             }
         }
         Ok(WantPartition {
@@ -451,70 +497,128 @@ impl Walker {
     /// haves are ignored (standard git behavior), known ones are reported in
     /// [`Selection::common`], and every known have dominates its entire
     /// ancestry. An unknown want is an error.
+    ///
+    /// The frontier is drained one commit-graph generation at a time. Each
+    /// level is every frontier entry sharing the current maximum generation;
+    /// the records for its commits were fetched when they were marked, so only
+    /// their parents' records need loading, and those are loaded as one
+    /// concurrent batch. The WANT/HAVE marking then runs synchronously in a
+    /// deterministic order (descending generation, then descending oid within
+    /// a level). This is equivalent to visiting commits one at a time because a
+    /// parent's generation is strictly smaller than its child's, so nothing
+    /// applied within a level can change another same-level commit's flag, and
+    /// serial depth drops from the commit count to the generation depth. A
+    /// per-walk record map keeps each commit-graph record fetched from the
+    /// store at most once.
     pub async fn select_commits(
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
     ) -> Result<Selection, WalkError> {
         let mut discovery = Discovery::default();
+        let mut records: HashMap<ObjectId, CommitGraphRecord> = HashMap::new();
         let mut common = Vec::new();
 
-        for have in haves {
-            if discovery.state.contains_key(have) {
-                continue; // duplicate have; already counted as common
-            }
-            match self.get_commit_info(have).await {
-                Ok(_) => {}
-                // The client claimed an oid this server has never seen (or
-                // that is not a commit): ignore it rather than failing the
-                // fetch. Only the have itself is excused — a missing object
-                // deeper in the ancestry is corruption and still errors.
-                Err(WalkError::MissingObject(missing)) if missing == *have => continue,
-                Err(WalkError::UnexpectedKind { oid, .. }) if oid == *have => continue,
+        // Prefetch every have's record at once, then mark the recognized ones
+        // in first-seen order. An unknown (or non-commit) have is dropped, but
+        // only the have itself is excused — a missing object deeper in the
+        // ancestry is corruption and still errors.
+        for (have, record) in self.prefetch_records(&mut records, haves).await {
+            match record {
+                Ok(info) => {
+                    common.push(have);
+                    discovery.mark(have, Flag::Have, info.generation);
+                }
+                Err(WalkError::MissingObject(missing)) if missing == have => {}
+                Err(WalkError::UnexpectedKind { oid, .. }) if oid == have => {}
                 Err(err) => return Err(err),
             }
-            common.push(*have);
-            self.mark(&mut discovery, *have, Flag::Have).await?;
         }
 
+        // Peel the wants to commits (queuing the tag objects), then prefetch
+        // and mark the commit wants. A want that is also a have is already
+        // HAVE, so its (skipped) WANT mark would be a no-op regardless.
         let (commit_wants, tags) = self.peel_wants(wants).await?;
-        for want in commit_wants {
-            self.mark(&mut discovery, want, Flag::Want).await?;
+        for (want, record) in self.prefetch_records(&mut records, &commit_wants).await {
+            discovery.mark(want, Flag::Want, record?.generation);
         }
 
-        // Pop highest generation first; stop once no wants are pending.
-        // A commit can sit in the heap more than once (re-pushed when a WANT
-        // was downgraded to HAVE), so `done` guards against reprocessing.
+        // Visit the highest generation first; stop once no wants are pending.
+        // A commit can sit in the frontier more than once (re-pushed when a
+        // WANT was downgraded to HAVE, or under corrupt generations that
+        // reorder the heap), so `done` guards against reprocessing.
         let mut to_send = Vec::new();
         let mut done: HashSet<ObjectId> = HashSet::new();
         while !discovery.pending.is_empty() {
-            let Some(QueueEntry { oid: id, .. }) = discovery.frontier.pop() else {
+            let Some(&QueueEntry {
+                generation: level_generation,
+                ..
+            }) = discovery.frontier.peek()
+            else {
                 // Every id in `pending` was pushed onto the frontier when it
-                // was marked WANT (see `mark`) and can only leave `pending`
-                // by being popped from here — either emitted below or
-                // downgraded to HAVE by a parent's `mark` call reached from
-                // some other pop. So the frontier cannot run dry while
-                // `pending` is non-empty, on healthy *or* corrupt
-                // commit-graph data: this is believed unreachable. Treat it
-                // as a hard error instead of silently truncating the pack,
-                // in case that invariant is ever wrong.
+                // was marked WANT (see `Discovery::mark`) and can only leave
+                // `pending` by being visited here — either emitted below or
+                // downgraded to HAVE by a parent's mark reached from some
+                // other level. So the frontier cannot run dry while `pending`
+                // is non-empty, on healthy *or* corrupt commit-graph data:
+                // this is believed unreachable. Treat it as a hard error
+                // instead of silently truncating the pack, in case that
+                // invariant is ever wrong.
                 return Err(WalkError::DiscoveryStalled {
                     unresolved: discovery.pending.iter().copied().collect(),
                 });
             };
-            if !done.insert(id) {
-                continue;
+
+            // Drain every frontier entry at the current maximum generation
+            // into one level, in descending-oid order, skipping duplicates and
+            // commits already visited in an earlier level.
+            let mut level = Vec::new();
+            let mut level_seen = HashSet::new();
+            while let Some(entry) = discovery.frontier.peek() {
+                if entry.generation != level_generation {
+                    break;
+                }
+                let id = discovery
+                    .frontier
+                    .pop()
+                    .expect("peeked entry is present")
+                    .oid;
+                if !done.contains(&id) && level_seen.insert(id) {
+                    level.push(id);
+                }
             }
-            let Some(flag) = discovery.state.get(&id).copied() else {
-                continue; // unreachable: everything in the heap was marked
-            };
-            if flag == Flag::Want {
-                to_send.push(id);
-                discovery.pending.remove(&id);
+
+            // The level's own records are already cached (fetched when the
+            // commits were marked); load their parents' records as one batch
+            // so the marking below is pure synchronous state mutation.
+            let parents: Vec<ObjectId> = level
+                .iter()
+                .filter_map(|id| records.get(id))
+                .flat_map(|info| info.parents.iter().copied())
+                .collect();
+            for (_, record) in self.prefetch_records(&mut records, &parents).await {
+                record?; // a parent missing from the graph is corruption
             }
-            let info = self.get_commit_info(&id).await?;
-            for parent in info.parents {
-                self.mark(&mut discovery, parent, flag).await?;
+
+            for id in level {
+                if !done.insert(id) {
+                    continue;
+                }
+                let Some(flag) = discovery.state.get(&id).copied() else {
+                    continue; // unreachable: everything in the frontier was marked
+                };
+                if flag == Flag::Want {
+                    to_send.push(id);
+                    discovery.pending.remove(&id);
+                }
+                let parents = records
+                    .get(&id)
+                    .map(|info| info.parents.clone())
+                    .unwrap_or_default();
+                for parent in parents {
+                    let generation = records[&parent].generation;
+                    discovery.mark(parent, flag, generation);
+                }
             }
         }
 
@@ -525,55 +629,72 @@ impl Walker {
     /// Phase II: expand the commits chosen by [`Walker::select_commits`]
     /// into the full set of objects to pack, skipping everything already
     /// reachable from the client's haves. Returns a deduplicated list in
-    /// insertion order: each commit followed by its new trees and blobs,
-    /// with wanted tag objects wherever they appear in `to_send`.
+    /// insertion order: each commit followed by its new trees and blobs, with
+    /// wanted tag objects wherever they appear in `to_send`. Within a commit
+    /// the trees and blobs come out in breadth-first order (each depth of the
+    /// tree read as one concurrent batch), which the pack tolerates because
+    /// entry order does not affect pack correctness (see `src/git/pack_out.rs`).
     ///
-    /// The have-side expansion visits every tree/blob under each have's root
-    /// tree once (the have-set doubles as its own seen-set); the want-side
-    /// walk prunes an entire subtree at the first tree the client already
-    /// has and adds blobs only when they are absent from the have-set, so an
-    /// incremental fetch is proportional to the diff, not the snapshot.
-    /// `filter` restricts which blobs are added on the want side (`blob:none`
-    /// also keeps blobs out of the have-set; see [`FilterSpec`]) — commits,
-    /// trees, and tags are always collected in full.
+    /// The have-side expansion walks every have's root tree in one shared
+    /// level-order traversal and visits each reachable tree/blob once (the
+    /// have-set doubles as its own seen-set); the want-side walk prunes an
+    /// entire subtree at the first tree the client already has and adds blobs
+    /// only when they are absent from the have-set, so an incremental fetch is
+    /// proportional to the diff, not the snapshot. `filter` restricts which
+    /// blobs are added on the want side (`blob:none` also keeps blobs out of
+    /// the have-set; see [`FilterSpec`]) — commits, trees, and tags are always
+    /// collected in full.
     pub async fn collect(
         &self,
         to_send: &[ObjectId],
         haves: &[ObjectId],
         filter: &FilterSpec,
     ) -> Result<Vec<ObjectId>, WalkError> {
-        let mut have_objects: HashSet<ObjectId> = HashSet::new();
-        for have in haves {
-            let info = match self.get_commit_info(have).await {
-                Ok(info) => info,
-                // Mirror discovery: an unknown (or non-commit) have is
-                // ignored; deeper misses are corruption and still error.
-                Err(WalkError::MissingObject(missing)) if missing == *have => continue,
-                Err(WalkError::UnexpectedKind { oid, .. }) if oid == *have => continue,
+        // Prefetch every have's record at once, then walk all recognized haves'
+        // root trees together. Mirror discovery's excusing: an unknown (or
+        // non-commit) have is ignored; deeper misses are corruption and error.
+        let mut records: HashMap<ObjectId, CommitGraphRecord> = HashMap::new();
+        let mut have_roots = Vec::new();
+        for (have, record) in self.prefetch_records(&mut records, haves).await {
+            match record {
+                Ok(info) => have_roots.push(info.root_tree),
+                Err(WalkError::MissingObject(missing)) if missing == have => {}
+                Err(WalkError::UnexpectedKind { oid, .. }) if oid == have => {}
                 Err(err) => return Err(err),
-            };
-            self.expand_haves(info.root_tree, &mut have_objects, filter)
-                .await?;
+            }
+        }
+        let mut have_objects: HashSet<ObjectId> = HashSet::new();
+        self.expand_haves(&have_roots, &mut have_objects, filter)
+            .await?;
+
+        // Classify the whole send list in one batch, then prefetch every
+        // commit's record so each commit's tree walk starts without a lookup.
+        let mut classified = Vec::with_capacity(to_send.len());
+        let mut commit_ids = Vec::new();
+        for (id, size) in self.object_sizes(to_send).await {
+            let (kind, _) = size?.ok_or(WalkError::MissingObject(id))?;
+            if kind == Kind::Commit {
+                commit_ids.push(id);
+            }
+            classified.push((id, kind));
+        }
+        for (_, record) in self.prefetch_records(&mut records, &commit_ids).await {
+            record?;
         }
 
         let mut objects = OrderedOidSet::default();
-        for id in to_send {
-            let (kind, _) = self
-                .objects
-                .size(self.repo, id)
-                .await?
-                .ok_or(WalkError::MissingObject(*id))?;
+        for (id, kind) in classified {
             match kind {
                 Kind::Commit => {
-                    objects.insert(*id);
-                    let info = self.get_commit_info(id).await?;
-                    self.walk_tree(info.root_tree, &mut objects, &have_objects, filter)
+                    objects.insert(id);
+                    let root_tree = records[&id].root_tree;
+                    self.walk_tree(root_tree, &mut objects, &have_objects, filter)
                         .await?;
                 }
-                Kind::Tag => objects.insert(*id),
+                Kind::Tag => objects.insert(id),
                 actual => {
                     return Err(WalkError::UnexpectedKind {
-                        oid: *id,
+                        oid: id,
                         expected: Kind::Commit,
                         actual,
                     });
@@ -583,81 +704,67 @@ impl Walker {
         Ok(objects.into_vec())
     }
 
-    /// Mark `id` with `flag`, updating `pending` and pushing the commit onto
-    /// the frontier when its state changed: a new WANT joins `pending`, a
-    /// WANT downgraded by a HAVE leaves it, and an established HAVE absorbs
-    /// everything. Both `pending` operations are idempotent, so re-marking
-    /// an id that already left (or never entered) the relevant state is
-    /// always safe.
-    async fn mark(
-        &self,
-        discovery: &mut Discovery,
-        id: ObjectId,
-        flag: Flag,
-    ) -> Result<(), WalkError> {
-        let resolved = match (discovery.state.get(&id), flag) {
-            (Some(Flag::Have), _) | (Some(Flag::Want), Flag::Want) => return Ok(()),
-            (Some(Flag::Want), Flag::Have) => {
-                discovery.pending.remove(&id);
-                Flag::Have
-            }
-            (None, Flag::Have) => Flag::Have,
-            (None, Flag::Want) => {
-                discovery.pending.insert(id);
-                Flag::Want
-            }
-        };
-        discovery.state.insert(id, resolved);
-        let generation = self.get_commit_info(&id).await?.generation;
-        discovery.frontier.push(QueueEntry {
-            generation,
-            oid: id,
-        });
-        Ok(())
-    }
-
     /// Resolve raw wants into commit wants plus the annotated tag objects to
-    /// send. Tag chains are chased tag-by-tag (each tag object in the chain
-    /// is sent) until a commit is reached; any other target kind is
-    /// unsupported.
+    /// send. Each want's tag chain is chased tag-by-tag (each tag object in the
+    /// chain is sent) until a commit is reached; any other target kind is
+    /// unsupported. The chains run as one concurrent batch but their results
+    /// are merged in want order, so `commit_wants` keeps want order and `tags`
+    /// keeps first-seen order, and the first want to fail (in want order)
+    /// surfaces its error.
     async fn peel_wants(
         &self,
         wants: &[ObjectId],
     ) -> Result<(Vec<ObjectId>, Vec<ObjectId>), WalkError> {
+        let chains: Vec<Result<(ObjectId, Vec<ObjectId>), WalkError>> =
+            stream::iter(wants.iter().copied())
+                .map(|want| self.peel_want(want))
+                .buffered(WALK_LOOKAHEAD)
+                .collect()
+                .await;
+
         let mut commit_wants = Vec::new();
         let mut tags = OrderedOidSet::default();
-        for want in wants {
-            let mut cursor = *want;
-            loop {
-                let Some((kind, body)) = self.objects.get(self.repo, &cursor).await? else {
-                    return Err(if cursor == *want {
-                        WalkError::UnknownWant(*want)
-                    } else {
-                        // A tag in the chain references a missing object:
-                        // server-side corruption, not a client mistake.
-                        WalkError::MissingObject(cursor)
-                    });
-                };
-                match kind {
-                    Kind::Commit => {
-                        commit_wants.push(cursor);
-                        break;
-                    }
-                    Kind::Tag => {
-                        tags.insert(cursor);
-                        let tag = TagRef::from_bytes(&body, cursor.kind()).map_err(|source| {
-                            WalkError::Decode {
-                                oid: cursor,
-                                source,
-                            }
-                        })?;
-                        cursor = tag.target();
-                    }
-                    kind => return Err(WalkError::UnsupportedWant { oid: cursor, kind }),
-                }
+        for chain in chains {
+            let (commit, chain_tags) = chain?;
+            commit_wants.push(commit);
+            for tag in chain_tags {
+                tags.insert(tag);
             }
         }
         Ok((commit_wants, tags.into_vec()))
+    }
+
+    /// Peel one want to its target commit, returning that commit and the tag
+    /// objects walked through on the way (in chain order). The chain is serial
+    /// — each hop's target is only known after decoding the current tag.
+    async fn peel_want(&self, want: ObjectId) -> Result<(ObjectId, Vec<ObjectId>), WalkError> {
+        let mut cursor = want;
+        let mut tags = Vec::new();
+        loop {
+            let Some((kind, body)) = self.objects.get(self.repo, &cursor).await? else {
+                return Err(if cursor == want {
+                    WalkError::UnknownWant(want)
+                } else {
+                    // A tag in the chain references a missing object:
+                    // server-side corruption, not a client mistake.
+                    WalkError::MissingObject(cursor)
+                });
+            };
+            match kind {
+                Kind::Commit => return Ok((cursor, tags)),
+                Kind::Tag => {
+                    tags.push(cursor);
+                    let tag = TagRef::from_bytes(&body, cursor.kind()).map_err(|source| {
+                        WalkError::Decode {
+                            oid: cursor,
+                            source,
+                        }
+                    })?;
+                    cursor = tag.target();
+                }
+                kind => return Err(WalkError::UnsupportedWant { oid: cursor, kind }),
+            }
+        }
     }
 
     /// Backfill of [`Walker::get_commit_info`]: compute and persist records
@@ -755,49 +862,65 @@ impl Walker {
         Ok((commit.tree(), commit.parents().collect()))
     }
 
-    /// Insert every tree and blob reachable from `root_tree` into
-    /// `have_objects`. The set doubles as the seen-set, so a subtree shared
-    /// between several haves is visited once and the total cost is bounded
-    /// by the number of distinct objects reachable from the haves.
+    /// Insert every tree and blob reachable from `roots` into `have_objects`,
+    /// walking all roots together one tree depth at a time: each level's trees
+    /// are read as one concurrent batch, then their child subtrees form the
+    /// next level. The set doubles as the seen-set, so a subtree shared between
+    /// several haves (or several roots) is visited once and the total cost is
+    /// bounded by the number of distinct objects reachable from the haves.
     /// `FilterSpec::BlobNone` keeps blobs out of the have-set too — a filtered
     /// have-side already has no blobs, so its have-set should not claim any.
     async fn expand_haves(
         &self,
-        root_tree: ObjectId,
+        roots: &[ObjectId],
         have_objects: &mut HashSet<ObjectId>,
         filter: &FilterSpec,
     ) -> Result<(), WalkError> {
-        let mut stack = vec![root_tree];
-        while let Some(tree_id) = stack.pop() {
-            if !have_objects.insert(tree_id) {
-                continue;
+        let mut level = Vec::new();
+        for root in roots {
+            if have_objects.insert(*root) {
+                level.push(*root);
             }
-            for entry in self.read_tree(&tree_id).await? {
-                match entry {
-                    TreeEntry::Subtree(child) => {
-                        if !have_objects.contains(&child) {
-                            stack.push(child);
+        }
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for entries in self.read_trees(&level).await? {
+                for entry in entries {
+                    match entry {
+                        TreeEntry::Subtree(child) => {
+                            // Marking on discovery (rather than when the child
+                            // is read) dedups the next level up front; the set
+                            // ends up identical either way.
+                            if have_objects.insert(child) {
+                                next.push(child);
+                            }
                         }
-                    }
-                    TreeEntry::Leaf(child) => {
-                        if !matches!(filter, FilterSpec::BlobNone) {
-                            have_objects.insert(child);
+                        TreeEntry::Leaf(child) => {
+                            if !matches!(filter, FilterSpec::BlobNone) {
+                                have_objects.insert(child);
+                            }
                         }
                     }
                 }
             }
+            level = next;
         }
         Ok(())
     }
 
-    /// Collect the trees and blobs under `root_tree` into `objects`,
-    /// skipping anything the client already has. Content addressing means an
-    /// identical tree id implies identical content all the way down, so the
-    /// walk prunes a whole subtree at the first tree found in `have_objects`
-    /// (or already collected — `objects` memoizes trees shared between the
-    /// commits being sent). Trees are always collected in full; `filter`
-    /// decides which of the remaining blobs are admitted (see
-    /// [`Walker::include_blob`]).
+    /// Collect the trees and blobs under `root_tree` into `objects`, skipping
+    /// anything the client already has. The tree is walked one depth at a
+    /// time: each level's trees are read as one concurrent batch and, for a
+    /// size filter, that level's candidate blobs are size-checked as one batch
+    /// too. Within a level the newly reached subtrees are collected first (in
+    /// parent order, then entry order), then the admitted blobs in the same
+    /// order — so a commit's objects come out in breadth-first order.
+    ///
+    /// Content addressing means an identical tree id implies identical content
+    /// all the way down, so the walk prunes a whole subtree at the first tree
+    /// found in `have_objects` (or already collected — `objects` memoizes trees
+    /// shared between the commits being sent). Trees are always collected in
+    /// full; `filter` decides which of the remaining blobs are admitted.
     async fn walk_tree(
         &self,
         root_tree: ObjectId,
@@ -805,53 +928,72 @@ impl Walker {
         have_objects: &HashSet<ObjectId>,
         filter: &FilterSpec,
     ) -> Result<(), WalkError> {
-        let mut stack = vec![root_tree];
-        while let Some(tree_id) = stack.pop() {
-            if objects.contains(&tree_id) || have_objects.contains(&tree_id) {
-                continue;
-            }
-            objects.insert(tree_id);
-            let mut subtrees = Vec::new();
-            for entry in self.read_tree(&tree_id).await? {
-                match entry {
-                    TreeEntry::Subtree(child) => subtrees.push(child),
-                    // The sole blob admission point: a blob is sent only
-                    // when the client's have-frontier lacks it and the
-                    // filter admits it.
-                    TreeEntry::Leaf(child) => {
-                        if !have_objects.contains(&child)
-                            && self.include_blob(child, filter).await?
-                        {
-                            objects.insert(child);
+        let mut level = Vec::new();
+        if !objects.contains(&root_tree) && !have_objects.contains(&root_tree) {
+            objects.insert(root_tree);
+            level.push(root_tree);
+        }
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            let mut blob_candidates = Vec::new();
+            let mut candidate_seen = HashSet::new();
+            for entries in self.read_trees(&level).await? {
+                for entry in entries {
+                    match entry {
+                        TreeEntry::Subtree(child) => {
+                            if !objects.contains(&child) && !have_objects.contains(&child) {
+                                objects.insert(child);
+                                next.push(child);
+                            }
+                        }
+                        // A blob is a candidate only when the client's
+                        // have-frontier lacks it and it is not already
+                        // collected; the filter has the final say below.
+                        TreeEntry::Leaf(child) => {
+                            if !have_objects.contains(&child)
+                                && !objects.contains(&child)
+                                && candidate_seen.insert(child)
+                            {
+                                blob_candidates.push(child);
+                            }
                         }
                     }
                 }
             }
-            // Depth-first in entry order: push in reverse so the first
-            // subtree is processed first.
-            for child in subtrees.into_iter().rev() {
-                stack.push(child);
-            }
+            self.admit_blobs(blob_candidates, objects, filter).await?;
+            level = next;
         }
         Ok(())
     }
 
-    /// Whether `filter` admits blob `id` into the send set. `BlobLimit`
-    /// decides from [`ObjectDb::size`] alone — the object record's inline
-    /// header or pointer payload — and never fetches the blob's content.
-    async fn include_blob(&self, id: ObjectId, filter: &FilterSpec) -> Result<bool, WalkError> {
+    /// Add the blobs `filter` admits from `candidates` to `objects`, in
+    /// candidate order. `BlobNone` admits none and `None` admits all without a
+    /// lookup; `BlobLimit` decides from [`ObjectDb::size`] alone — the object
+    /// record's inline header or pointer payload — read as one concurrent
+    /// batch and never fetching any blob's content.
+    async fn admit_blobs(
+        &self,
+        candidates: Vec<ObjectId>,
+        objects: &mut OrderedOidSet,
+        filter: &FilterSpec,
+    ) -> Result<(), WalkError> {
         match *filter {
-            FilterSpec::None => Ok(true),
-            FilterSpec::BlobNone => Ok(false),
+            FilterSpec::None => {
+                for child in candidates {
+                    objects.insert(child);
+                }
+            }
+            FilterSpec::BlobNone => {}
             FilterSpec::BlobLimit(limit) => {
-                let (_, size) = self
-                    .objects
-                    .size(self.repo, &id)
-                    .await?
-                    .ok_or(WalkError::MissingObject(id))?;
-                Ok(size <= limit)
+                for (child, size) in self.object_sizes(&candidates).await {
+                    let (_, size) = size?.ok_or(WalkError::MissingObject(child))?;
+                    if size <= limit {
+                        objects.insert(child);
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// Read and parse a tree object into walk-relevant entries, dropping
@@ -881,6 +1023,67 @@ impl Walker {
             }
         }
         Ok(entries)
+    }
+
+    /// Read and parse every tree in `ids` as one bounded-width concurrent
+    /// batch (see [`Walker::read_tree`]), returning their entries aligned to
+    /// `ids`. Lookups run concurrently but results are yielded in input order,
+    /// so the caller consumes them deterministically and the first failing
+    /// tree (in input order) surfaces its error.
+    async fn read_trees(&self, ids: &[ObjectId]) -> Result<Vec<Vec<TreeEntry>>, WalkError> {
+        stream::iter(ids.iter().copied())
+            .map(|id| async move { self.read_tree(&id).await })
+            .buffered(WALK_LOOKAHEAD)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// Read the kind and content size of every id in `ids` as one bounded-width
+    /// concurrent batch, pairing each id with its [`ObjectDb::size`] result in
+    /// input order. Never touches blob content; each caller maps an absent
+    /// record to the error it wants (an unknown want vs. a missing object).
+    async fn object_sizes(
+        &self,
+        ids: &[ObjectId],
+    ) -> Vec<(ObjectId, Result<Option<(Kind, u64)>, ObjectDbError>)> {
+        stream::iter(ids.iter().copied())
+            .map(|id| async move { (id, self.objects.size(self.repo, &id).await) })
+            .buffered(WALK_LOOKAHEAD)
+            .collect()
+            .await
+    }
+
+    /// Load the commit-graph records for `ids` that are not already in `cache`,
+    /// as one bounded-width concurrent batch, inserting the successes into
+    /// `cache`. Returns each freshly fetched id paired with its result in
+    /// first-seen input order (ids already cached are omitted — the cache
+    /// already holds their record). Concurrent lazy backfills of overlapping
+    /// ancestries are safe: the records they write are idempotent derived data.
+    async fn prefetch_records(
+        &self,
+        cache: &mut HashMap<ObjectId, CommitGraphRecord>,
+        ids: &[ObjectId],
+    ) -> Vec<(ObjectId, Result<CommitGraphRecord, WalkError>)> {
+        let mut misses = Vec::new();
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !cache.contains_key(id) && seen.insert(*id) {
+                misses.push(*id);
+            }
+        }
+        let fetched: Vec<(ObjectId, Result<CommitGraphRecord, WalkError>)> = stream::iter(misses)
+            .map(|id| async move { (id, self.get_commit_info(&id).await) })
+            .buffered(WALK_LOOKAHEAD)
+            .collect()
+            .await;
+        for (id, record) in &fetched {
+            if let Ok(record) = record {
+                cache.insert(*id, record.clone());
+            }
+        }
+        fetched
     }
 }
 
@@ -1780,5 +1983,91 @@ mod tests {
             .expect("get graph")
             .expect("record written");
         assert_eq!(record.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn should_select_a_wide_octopus_merge_in_descending_generation_order() {
+        // given: a base commit with many sibling children joined by one
+        // octopus merge — a frontier that only ever fans out wide, never deep.
+        let w = walker().await;
+        let c0 = chain(&w, 1).await[0];
+        let mut sides = Vec::new();
+        for i in 0..8 {
+            let b = blob(&w, format!("side {i}").as_bytes()).await;
+            let t = tree(&w, &[(EntryKind::Blob, "s.txt", b)]).await;
+            sides.push(commit(&w, t, &[c0], &format!("side {i}")).await);
+        }
+        let merged = blob(&w, b"merged").await;
+        let merge_tree = tree(&w, &[(EntryKind::Blob, "s.txt", merged)]).await;
+        let m = commit(&w, merge_tree, &sides, "octopus").await;
+
+        // when: cloning the merge tip.
+        let clone = w.select_commits(&[m], &[]).await.expect("select");
+
+        // then: every commit is sent once, the merge (highest generation)
+        // first and the base (lowest) last, in non-increasing generation order.
+        let mut all = vec![m];
+        all.extend(sides.iter().copied());
+        all.push(c0);
+        assert_eq!(as_set(&clone.to_send), as_set(&all));
+        assert_eq!(clone.to_send.first(), Some(&m));
+        assert_eq!(clone.to_send.last(), Some(&c0));
+        let mut generations = Vec::new();
+        for id in &clone.to_send {
+            generations.push(w.get_commit_info(id).await.expect("info").generation);
+        }
+        assert!(
+            generations.windows(2).all(|pair| pair[0] >= pair[1]),
+            "commits must be in descending generation order"
+        );
+        assert!(clone.common.is_empty());
+
+        // when: the client already has one side of the merge.
+        let incremental = w.select_commits(&[m], &[sides[0]]).await.expect("select");
+
+        // then: that side and the shared base drop out; the merge and the
+        // other sides are all that remain.
+        let mut expected = vec![m];
+        expected.extend(sides.iter().skip(1).copied());
+        assert_eq!(as_set(&incremental.to_send), as_set(&expected));
+        assert_eq!(incremental.common, vec![sides[0]]);
+    }
+
+    #[tokio::test]
+    async fn should_collect_a_wide_tree_in_one_level_order_traversal() {
+        // given: a commit whose root tree fans out into many blobs plus a
+        // couple of subtrees — width at each level, only a shallow depth.
+        let w = walker().await;
+        let names: Vec<String> = (0..40).map(|i| format!("f{i:02}.txt")).collect();
+        let mut expected = Vec::new();
+        let mut root_entries = Vec::new();
+        for name in &names {
+            let b = blob(&w, name.as_bytes()).await;
+            expected.push(b);
+            root_entries.push((EntryKind::Blob, name.as_str(), b));
+        }
+        let sub_a_leaf = blob(&w, b"a leaf").await;
+        let sub_a = tree(&w, &[(EntryKind::Blob, "leaf.txt", sub_a_leaf)]).await;
+        let sub_b_leaf = blob(&w, b"b leaf").await;
+        let sub_b = tree(&w, &[(EntryKind::Blob, "leaf.txt", sub_b_leaf)]).await;
+        expected.extend([sub_a, sub_a_leaf, sub_b, sub_b_leaf]);
+        root_entries.push((EntryKind::Tree, "sub_a", sub_a));
+        root_entries.push((EntryKind::Tree, "sub_b", sub_b));
+        let root = tree(&w, &root_entries).await;
+        let c = commit(&w, root, &[], "wide").await;
+        expected.push(root);
+        expected.push(c);
+
+        // when: cloning the commit.
+        let collected = w
+            .collect(&[c], &[], &FilterSpec::None)
+            .await
+            .expect("collect");
+
+        // then: the whole closure is collected exactly once and the commit
+        // leads its objects.
+        assert_eq!(collected.first(), Some(&c));
+        assert_eq!(as_set(&collected), as_set(&expected));
+        assert_eq!(collected.len(), expected.len());
     }
 }
