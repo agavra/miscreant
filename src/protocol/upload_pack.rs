@@ -29,8 +29,10 @@ use crate::storage::{ObjectDb, ObjectDbError, RepoMeta, Store, StoreError};
 const RESULT_CONTENT_TYPE: &str = "application/x-git-upload-pack-result";
 
 /// Upper bound on symref indirection when resolving a ref to an object id. A
-/// chain longer than this, or one that dangles, leaves the ref unresolved, and
-/// an unresolved ref is omitted from the advertisement.
+/// chain longer than this leaves the ref unresolved and it is omitted from the
+/// advertisement. A chain that dangles within the cap (its last hop names a
+/// nonexistent ref) is also unresolved, but may still be advertised as an
+/// unborn ref when the client requested `unborn`.
 const MAX_SYMREF_DEPTH: usize = 5;
 
 /// Upper bound on tag-object indirection when peeling a ref to its final
@@ -113,8 +115,11 @@ fn error_response<E: Classify + std::error::Error>(err: &E) -> Response {
 
 /// Serve the `ls-refs` command: advertise refs (optionally restricted by
 /// `ref-prefix`), each resolved to an object id, with `symref-target` and
-/// `peeled` attributes when requested. Output is `<oid> <refname>` lines in
-/// refname order (HEAD sorts first) terminated by a flush.
+/// `peeled` attributes when requested. A symbolic ref that dangles within the
+/// depth cap (e.g. HEAD on an empty repository) is reported as `unborn` when
+/// requested, or omitted otherwise. Output is `<oid> <refname>` (or
+/// `unborn <refname>`) lines in refname order (HEAD sorts first) terminated
+/// by a flush.
 async fn ls_refs(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     let parsed = match LsRefsArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -136,10 +141,27 @@ async fn build_ls_refs(
     let refs = gather_refs(&state.store, repo, &args.prefixes).await?;
     let mut body = Vec::new();
     for (name, target) in refs {
-        let Some(oid) = resolve_ref(&state.store, repo, &target).await? else {
-            // A dangling or too-deep symref (e.g. HEAD on an empty repository)
-            // has no object id to advertise.
-            continue;
+        let oid = match resolve_ref(&state.store, repo, &target).await? {
+            Resolution::Resolved(oid) => oid,
+            // A chain that dangles within the depth cap (e.g. HEAD on an
+            // empty repository) has no object id, but is still a named
+            // branch-to-be: advertise it as unborn when asked.
+            Resolution::Dangling => {
+                if args.unborn
+                    && let RefTarget::Reference(inner) = &target
+                {
+                    let mut line = format!("unborn {name}");
+                    if args.symrefs {
+                        line.push_str(&format!(" symref-target:{inner}"));
+                    }
+                    line.push('\n');
+                    encode::data_to_write(line.as_bytes(), &mut body)?;
+                }
+                continue;
+            }
+            // A chain exceeding the depth cap has no reliable target to
+            // report and is omitted outright.
+            Resolution::TooDeep => continue,
         };
         let mut line = format!("{} {name}", oid.to_hex());
         if args.symrefs
@@ -179,25 +201,36 @@ async fn gather_refs(
     Ok(refs.into_iter().collect())
 }
 
+/// The outcome of following a ref target to a direct object id.
+enum Resolution {
+    /// The chain terminated at a direct object id.
+    Resolved(ObjectId),
+    /// The chain dangled within the depth cap: some hop names a ref that does
+    /// not exist (e.g. HEAD on an empty repository pointing at a branch that
+    /// was never created).
+    Dangling,
+    /// The chain did not terminate within [`MAX_SYMREF_DEPTH`] hops.
+    TooDeep,
+}
+
 /// Follow a ref target to a direct object id, chasing symref chains up to
-/// [`MAX_SYMREF_DEPTH`]. Returns `None` for a chain that dangles (a symref to a
-/// nonexistent ref, e.g. HEAD on an empty repository) or exceeds the depth cap.
+/// [`MAX_SYMREF_DEPTH`].
 async fn resolve_ref(
     store: &Store,
     repo: RepoId,
     target: &RefTarget,
-) -> Result<Option<ObjectId>, StoreError> {
+) -> Result<Resolution, StoreError> {
     let mut current = target.clone();
     for _ in 0..MAX_SYMREF_DEPTH {
         match current {
-            RefTarget::Direct(oid) => return Ok(Some(oid)),
+            RefTarget::Direct(oid) => return Ok(Resolution::Resolved(oid)),
             RefTarget::Reference(name) => match store.get_ref(repo, &name).await? {
                 Some(next) => current = next,
-                None => return Ok(None),
+                None => return Ok(Resolution::Dangling),
             },
         }
     }
-    Ok(None)
+    Ok(Resolution::TooDeep)
 }
 
 /// Peel a ref's object to its final non-tag object, following tag chains up to
@@ -310,11 +343,14 @@ struct LsRefsArgs {
     symrefs: bool,
     /// Include a `peeled` attribute for refs pointing at tag objects.
     peel: bool,
+    /// Report dangling symbolic refs (within the depth cap) as `unborn`
+    /// instead of omitting them.
+    unborn: bool,
 }
 
 impl LsRefsArgs {
-    /// Parse `ls-refs` argument lines. `unborn` is accepted and ignored; any
-    /// other unrecognized argument is returned for an `ERR` reply.
+    /// Parse `ls-refs` argument lines. An unrecognized argument is returned
+    /// for an `ERR` reply.
     fn parse(args: &[String]) -> Result<Self, &str> {
         let mut parsed = LsRefsArgs::default();
         for arg in args {
@@ -324,9 +360,7 @@ impl LsRefsArgs {
                 match arg.as_str() {
                     "symrefs" => parsed.symrefs = true,
                     "peel" => parsed.peel = true,
-                    // Advertising an unborn HEAD on an empty repository is not
-                    // supported; the argument is accepted and ignored.
-                    "unborn" => {}
+                    "unborn" => parsed.unborn = true,
                     other => return Err(other),
                 }
             }
@@ -455,14 +489,15 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_and_ignore_the_unborn_argument() {
-        // given/when: unborn is tolerated for clients that request it
+    fn should_parse_the_unborn_argument() {
+        // given/when
         let parsed = LsRefsArgs::parse(&["unborn".to_owned()]).expect("parse args");
 
-        // then: it sets no flag and is otherwise a no-op
+        // then: only the unborn flag is set
         assert!(parsed.prefixes.is_empty());
         assert!(!parsed.symrefs);
         assert!(!parsed.peel);
+        assert!(parsed.unborn);
     }
 
     #[test]

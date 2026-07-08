@@ -21,16 +21,6 @@ Miscreant. See `docs/0001-init.md` for the design.
   REF_DELTA for genuine thin-pack (out-of-pack) bases — but a client that does
   not support `ofs-delta` could produce packs we cannot ingest.
 
-## Fetch / upload
-
-- **Unborn HEAD is not advertised on an empty repository.** `ls-refs` accepts
-  the `unborn` argument but ignores it: a symbolic ref that resolves to a
-  nonexistent branch (an empty repo's `HEAD` → `refs/heads/main`) is omitted
-  from the advertisement rather than reported as an unborn ref with its target.
-  Clients listing or cloning an empty repository therefore see no refs (they
-  still exit successfully). Advertising unborn HEAD with its symref target is
-  future work.
-
 ## Receive / push
 
 - **Ref updates enforce compare-and-swap only, not a fast-forward/force

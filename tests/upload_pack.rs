@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{TestServer, commit_file, git, init_repo, rev_parse, test_config};
+use common::{TestServer, commit_file, git, git_ok, init_repo, rev_parse, test_config};
 use gix_hash::ObjectId;
 use miscreant::storage::values::RefTarget;
 
@@ -203,6 +203,79 @@ async fn should_report_symref_target_for_head() {
         body.contains("HEAD symref-target:refs/heads/main"),
         "body: {body}"
     );
+}
+
+#[tokio::test]
+async fn should_advertise_unborn_head_on_an_empty_repo_when_requested() {
+    // given: a freshly auto-created, empty repository — HEAD symrefs to
+    // refs/heads/main, which does not exist yet
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+
+    // when: the client asks for both unborn and symref-target reporting
+    let response = post_upload_pack(
+        &server.base_url(),
+        "proj",
+        ls_refs_body(&["unborn", "symrefs"]),
+    )
+    .await;
+
+    // then: the body is exactly the unborn HEAD line plus the flush
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    let mut expected = pkt(b"unborn HEAD symref-target:refs/heads/main\n");
+    expected.extend_from_slice(FLUSH);
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn should_omit_unborn_head_on_an_empty_repo_when_not_requested() {
+    // given: a freshly auto-created, empty repository
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+
+    // when: symrefs is requested but unborn is not
+    let response = post_upload_pack(&server.base_url(), "proj", ls_refs_body(&["symrefs"])).await;
+
+    // then: HEAD dangles and is omitted, leaving just the flush
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    assert_eq!(body.as_ref(), FLUSH);
+}
+
+// Multi-threaded: the real `git clone` subprocess blocks its thread on HTTP
+// the in-process server must answer concurrently.
+#[tokio::test(flavor = "multi_thread")]
+async fn should_clone_an_empty_repo_onto_the_servers_default_branch() {
+    // given: an empty repository and a client configured to default new
+    // clones to `master` instead of the server's `main`
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+    let url = format!("{}/proj.git", server.base_url());
+    let clone_dir = server.tempdir().join("clone");
+
+    // when
+    let clone = git(
+        server.tempdir(),
+        &[
+            "-c",
+            "init.defaultBranch=master",
+            "clone",
+            &url,
+            clone_dir.to_str().expect("utf-8 clone dir path"),
+        ],
+    );
+
+    // then: the clone succeeds and its HEAD names the server's default
+    // branch, not the client's configured default
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    let head = String::from_utf8(git_ok(&clone_dir, &["symbolic-ref", "HEAD"]))
+        .expect("utf-8 symbolic-ref output");
+    assert_eq!(head.trim(), "refs/heads/main");
 }
 
 #[tokio::test]

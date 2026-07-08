@@ -26,7 +26,7 @@ fn expected_upload_advert() -> Vec<u8> {
     expected.extend_from_slice(FLUSH);
     expected.extend(pkt(b"version 2\n"));
     expected.extend(pkt(format!("{}\n", agent_capability()).as_bytes()));
-    expected.extend(pkt(b"ls-refs\n"));
+    expected.extend(pkt(b"ls-refs=unborn\n"));
     expected.extend(pkt(b"fetch\n"));
     expected.extend(pkt(b"object-format=sha1\n"));
     expected.extend_from_slice(FLUSH);
