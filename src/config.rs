@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use clap::Args;
+use clap::parser::ValueSource;
+use serde::Deserialize;
 use url::Url;
 
 /// Server configuration, populated from CLI flags and `MISCREANT_*`
@@ -46,6 +48,12 @@ pub struct Config {
         default_value_os_t = default_staging_root()
     )]
     pub staging_root: PathBuf,
+
+    /// TOML file supplying defaults for any of the flags/env vars above that
+    /// were left unset (see `FileConfig`). A path that cannot be read or
+    /// parsed is a startup error; there is no implicit discovery.
+    #[arg(long = "config", env = "MISCREANT_CONFIG", value_name = "PATH")]
+    pub config_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -56,6 +64,7 @@ impl Default for Config {
             inline_threshold: 65536,
             auto_create_repos: true,
             staging_root: default_staging_root(),
+            config_path: None,
         }
     }
 }
@@ -122,8 +131,109 @@ fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Default `log_filter` when neither `RUST_LOG` nor a config file set one.
+pub const DEFAULT_LOG_FILTER: &str = "info";
+
+/// TOML mirror of [`Config`], loaded from `--config`/`MISCREANT_CONFIG`.
+/// Every field is optional so [`merge_file_config`] can tell "the file left
+/// this unset" from any concrete value (including a falsy one like `false`
+/// or `0`); unknown keys are rejected so a typo fails loudly at startup
+/// rather than being silently ignored.
+///
+/// `log_filter` has no [`Config`] counterpart: it is a
+/// `tracing_subscriber::EnvFilter` directive consumed in `main` to pick the
+/// subscriber's default directive, before any handler ever reads `Config`.
+/// `RUST_LOG`, when set, always wins over it (see `main.rs`).
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileConfig {
+    pub bind_addr: Option<SocketAddr>,
+    pub storage_url: Option<String>,
+    pub inline_threshold: Option<usize>,
+    pub auto_create_repos: Option<bool>,
+    pub staging_root: Option<PathBuf>,
+    pub log_filter: Option<String>,
+}
+
+/// A `--config`/`MISCREANT_CONFIG` path that could not be read or parsed.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigFileError {
+    #[error("failed to read config file {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse config file {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
+
+impl FileConfig {
+    /// Read and parse `path`. Neither a missing file nor a parse failure
+    /// (including an unknown key) is ever silently ignored.
+    pub fn load(path: &Path) -> Result<Self, ConfigFileError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| ConfigFileError::Parse {
+            path: path.to_owned(),
+            source,
+        })
+    }
+}
+
+/// Merge `file` into `config`, one field at a time, but only where `matches`
+/// reports the CLI/env value came from `Config`'s built-in default: an
+/// explicit `--flag` or `MISCREANT_*` value must always win over the file,
+/// even when it happens to equal the default (clap reports that case as
+/// `ValueSource::CommandLine`/`EnvVariable`, never `DefaultValue`, so the
+/// check below preserves it correctly). `matches` must be the `ArgMatches`
+/// that `config` itself was built from — see `main.rs` for why that is the
+/// top-level `Cli` matches even when a subcommand was also given.
+pub fn merge_file_config(
+    matches: &clap::ArgMatches,
+    mut config: Config,
+    file: &FileConfig,
+) -> Config {
+    let left_at_default = |id: &str| matches.value_source(id) == Some(ValueSource::DefaultValue);
+
+    if left_at_default("bind_addr")
+        && let Some(value) = file.bind_addr
+    {
+        config.bind_addr = value;
+    }
+    if left_at_default("storage_url")
+        && let Some(value) = &file.storage_url
+    {
+        config.storage_url = value.clone();
+    }
+    if left_at_default("inline_threshold")
+        && let Some(value) = file.inline_threshold
+    {
+        config.inline_threshold = value;
+    }
+    if left_at_default("auto_create_repos")
+        && let Some(value) = file.auto_create_repos
+    {
+        config.auto_create_repos = value;
+    }
+    if left_at_default("staging_root")
+        && let Some(value) = &file.staging_root
+    {
+        config.staging_root = value.clone();
+    }
+    config
+}
+
 #[cfg(test)]
 mod tests {
+    use clap::FromArgMatches;
+
     use super::*;
 
     #[test]
@@ -173,5 +283,197 @@ mod tests {
         // then
         assert!(normalized.starts_with("file:///"));
         assert!(normalized.ends_with("/miscreant-data"));
+    }
+
+    /// Parse `args` (program name included, e.g. `["test", "--bind-addr",
+    /// "…"]`) the same way `main.rs` parses `Cli`: build a `Command` from
+    /// `Config`'s own arg definitions, then keep the `ArgMatches` alongside
+    /// the parsed struct so a test can inspect `value_source` exactly like
+    /// [`merge_file_config`] does.
+    fn parse_config(args: &[&str]) -> (Config, clap::ArgMatches) {
+        let command = Config::augment_args(clap::Command::new("test"));
+        let matches = command.try_get_matches_from(args).expect("parse args");
+        let config = Config::from_arg_matches(&matches).expect("build config");
+        (config, matches)
+    }
+
+    /// Serializes every test that parses `Config` or touches `MISCREANT_*`
+    /// process environment variables. `Config`'s fields are declared with
+    /// `env = "MISCREANT_*"`, so any test that calls [`parse_config`]
+    /// observes whatever another thread currently has set — cargo runs
+    /// tests in one process on multiple threads by default, so this lock
+    /// (not a `serial-test` dependency) is what actually gives each test an
+    /// isolated view of the environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire [`ENV_LOCK`], recovering from a poisoned lock (an earlier
+    /// test panicked while holding it) so one failure cannot cascade into
+    /// spurious failures elsewhere.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets `MISCREANT_*` environment variables for the duration of a test
+    /// and scrubs them on drop (including on an assertion panic mid-test).
+    /// Only sound while the caller also holds [`ENV_LOCK`] for at least as
+    /// long as this guard lives (drop order: declare the lock first, this
+    /// guard second, so the scrub runs before the lock is released).
+    struct EnvVarGuard {
+        keys: Vec<&'static str>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            for (key, value) in vars {
+                // SAFETY: guarded by ENV_LOCK (see the struct doc comment).
+                unsafe { std::env::set_var(key, value) };
+            }
+            Self {
+                keys: vars.iter().map(|(key, _)| *key).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                // SAFETY: see `EnvVarGuard::set`.
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+    }
+
+    #[test]
+    fn should_apply_file_only_values_left_at_their_default() {
+        // given: no CLI/env overrides, and a file setting every merged field
+        let _env_lock = lock_env();
+        let (config, matches) = parse_config(&["test"]);
+        let file = FileConfig {
+            bind_addr: Some("127.0.0.1:9000".parse().unwrap()),
+            storage_url: Some("memory://".to_owned()),
+            inline_threshold: Some(1024),
+            auto_create_repos: Some(false),
+            staging_root: Some(PathBuf::from("/tmp/from-file")),
+            log_filter: None,
+        };
+
+        // when
+        let merged = merge_file_config(&matches, config, &file);
+
+        // then
+        assert_eq!(merged.bind_addr, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(merged.storage_url, "memory://");
+        assert_eq!(merged.inline_threshold, 1024);
+        assert!(!merged.auto_create_repos);
+        assert_eq!(merged.staging_root, PathBuf::from("/tmp/from-file"));
+    }
+
+    #[test]
+    fn should_prefer_an_explicit_cli_value_over_the_file_even_when_it_equals_the_default() {
+        // given: bind_addr given explicitly on the CLI, equal to the built-in
+        // default (so DefaultValue vs. CommandLine is the only distinguisher)
+        let _env_lock = lock_env();
+        let default_addr = default_bind_addr();
+        let (config, matches) = parse_config(&["test", "--bind-addr", &default_addr.to_string()]);
+        let file = FileConfig {
+            bind_addr: Some("127.0.0.1:9000".parse().unwrap()),
+            ..FileConfig::default()
+        };
+
+        // when
+        let merged = merge_file_config(&matches, config, &file);
+
+        // then: the explicit CLI value wins, not the file's
+        assert_eq!(merged.bind_addr, default_addr);
+    }
+
+    #[test]
+    fn should_prefer_environment_variables_over_the_file() {
+        // given: every MISCREANT_* env var set to a non-default value, and a
+        // file that disagrees with all of them. Every env-precedence
+        // assertion lives in this one test function because process env is
+        // global to the test binary; `EnvVarGuard` scrubs the vars on drop
+        // before `_env_lock` releases the module-wide environment lock.
+        let _env_lock = lock_env();
+        let _env = EnvVarGuard::set(&[
+            ("MISCREANT_BIND_ADDR", "127.0.0.1:6000"),
+            ("MISCREANT_STORAGE_URL", "memory://"),
+            ("MISCREANT_INLINE_THRESHOLD", "2048"),
+            ("MISCREANT_AUTO_CREATE_REPOS", "false"),
+            ("MISCREANT_STAGING_ROOT", "/tmp/from-env"),
+        ]);
+        let (config, matches) = parse_config(&["test"]);
+        let file = FileConfig {
+            bind_addr: Some("127.0.0.1:9000".parse().unwrap()),
+            storage_url: Some("file:///from-file".to_owned()),
+            inline_threshold: Some(1),
+            auto_create_repos: Some(true),
+            staging_root: Some(PathBuf::from("/tmp/from-file")),
+            log_filter: None,
+        };
+
+        // when
+        let merged = merge_file_config(&matches, config, &file);
+
+        // then: the environment values win over the file for every field
+        assert_eq!(merged.bind_addr, "127.0.0.1:6000".parse().unwrap());
+        assert_eq!(merged.storage_url, "memory://");
+        assert_eq!(merged.inline_threshold, 2048);
+        assert!(!merged.auto_create_repos);
+        assert_eq!(merged.staging_root, PathBuf::from("/tmp/from-env"));
+    }
+
+    #[test]
+    fn should_reject_an_unknown_key_in_the_config_file() {
+        // given: a file with a field name miscreant does not recognize
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "bind_addr = \"127.0.0.1:9000\"\nbogus = true\n")
+            .expect("write config file");
+
+        // when
+        let err = FileConfig::load(&path).expect_err("unknown key must be rejected");
+
+        // then: the error names the offending key, not just "parse failed"
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+        assert!(err.to_string().contains("bogus"), "error: {err}");
+    }
+
+    #[test]
+    fn should_error_when_the_config_file_is_missing() {
+        // given: a path with no file on disk
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.toml");
+
+        // when
+        let err = FileConfig::load(&path).expect_err("missing file must error");
+
+        // then
+        assert!(matches!(err, ConfigFileError::Read { .. }));
+    }
+
+    #[test]
+    fn should_parse_the_example_toml_config_matching_built_in_defaults() {
+        // given: the example file checked in at the repository root
+        let example_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("miscreant.example.toml");
+
+        // when
+        let file = FileConfig::load(&example_path).expect("example file parses");
+
+        // then: every documented default matches `Config::default()`, except
+        // staging_root, whose parent (the system temp directory) is
+        // environment-specific — only its final path component is pinned.
+        let defaults = Config::default();
+        assert_eq!(file.bind_addr, Some(defaults.bind_addr));
+        assert_eq!(file.storage_url, Some(defaults.storage_url));
+        assert_eq!(file.inline_threshold, Some(defaults.inline_threshold));
+        assert_eq!(file.auto_create_repos, Some(defaults.auto_create_repos));
+        assert_eq!(
+            file.staging_root.as_ref().and_then(|path| path.file_name()),
+            defaults.staging_root.file_name(),
+        );
+        assert_eq!(file.log_filter.as_deref(), Some(DEFAULT_LOG_FILTER));
     }
 }

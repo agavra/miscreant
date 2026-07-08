@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use miscreant::config::{self, FileConfig};
 use miscreant::git::walk::Walker;
 use miscreant::{AppState, Config, app};
 use tokio::net::TcpListener;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 /// `miscreant` with no subcommand serves the git HTTP(S) protocol (the
@@ -41,12 +41,47 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let Cli { config, command } = Cli::parse();
+    // Parsed by hand (rather than `Cli::parse()`) so the `ArgMatches` survive
+    // past parsing: merging a config file needs `value_source` per flattened
+    // `Config` field, which the `Cli`/`Config` values alone cannot tell us.
+    let matches = Cli::command().get_matches();
+    let Cli { config, command } = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    let file_config = config
+        .config_path
+        .as_ref()
+        .map(|path| {
+            FileConfig::load(path)
+                .with_context(|| format!("failed to load config file {}", path.display()))
+        })
+        .transpose()?;
+    let config = match &file_config {
+        // `Config` is flattened directly into `Cli` (see its doc comment), so
+        // its fields' ids live on `matches` itself regardless of whether a
+        // subcommand was also given — verified empirically for both
+        // `miscreant --flag serve` and `miscreant --flag rebuild-graph
+        // --repo <name>` (a flag placed after the subcommand name is
+        // rejected as unrecognized, since flattened args are not `global`).
+        Some(file) => config::merge_file_config(&matches, config, file),
+        None => config,
+    };
+
+    // `log_filter` is not a `Config` field: it only ever feeds the
+    // subscriber's default directive, chosen here before anything about
+    // `Config` is read. `EnvFilter::from_env_lossy` already gives `RUST_LOG`
+    // priority over whatever default directive we pass it.
+    let log_filter = file_config
+        .as_ref()
+        .and_then(|file| file.log_filter.clone())
+        .unwrap_or_else(|| config::DEFAULT_LOG_FILTER.to_owned());
+    let default_directive = log_filter
+        .parse()
+        .with_context(|| format!("invalid log_filter directive {log_filter:?}"))?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
+                .with_default_directive(default_directive)
                 .from_env_lossy(),
         )
         .init();

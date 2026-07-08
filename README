@@ -24,6 +24,35 @@ Then clone it back from any other directory:
     git clone http://127.0.0.1:8470/miscreant
 
 
+Configuration
+-------------
+
+Every option can be set as a `--flag`, a `MISCREANT_*` environment
+variable, or a key in a TOML file. Precedence, highest first:
+
+    CLI flag  >  MISCREANT_* environment variable  >  config file  >  default
+
+    --bind-addr             MISCREANT_BIND_ADDR           127.0.0.1:8470
+    --storage-url           MISCREANT_STORAGE_URL         file://./miscreant-data
+    --inline-threshold      MISCREANT_INLINE_THRESHOLD    65536
+    --auto-create-repos     MISCREANT_AUTO_CREATE_REPOS   true
+    --staging-root          MISCREANT_STAGING_ROOT        <system temp dir>/miscreant-staging
+    --config                MISCREANT_CONFIG              (none, no implicit discovery)
+
+Point `--config`/`MISCREANT_CONFIG` at a TOML file to set any of the above
+(plus `log_filter`, which has no flag of its own); a path that is missing or
+fails to parse is a startup error. See `miscreant.example.toml` at the
+repository root for every key with its default and a description:
+
+    cargo run -- --config miscreant.example.toml
+
+The server logs its effective configuration once at startup (`starting`),
+after CLI/env/file/default precedence is resolved, so you can confirm what
+actually took effect. Logging is controlled by `RUST_LOG` (default `info`);
+`RUST_LOG=info,access=debug` additionally turns on one line per HTTP request
+without raising the noise level of everything else.
+
+
 Why Miscreant?
 --------------
 

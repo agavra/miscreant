@@ -22,10 +22,12 @@ gix-pack = { version = "0.72.0", default-features = false, features = [
 gix-packetline-blocking = "0.19.3"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
 slatedb = { version = "0.14.1", features = ["aws"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
+toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5"

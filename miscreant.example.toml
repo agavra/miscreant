@@ -1,0 +1,26 @@
+# Example miscreant configuration file. Every key is optional; pass this
+# file with `--config miscreant.example.toml` (or MISCREANT_CONFIG=...).
+# Precedence is CLI flag > MISCREANT_* environment variable > this file >
+# the built-in default shown below for each key.
+
+# Address the HTTP server listens on.
+bind_addr = "127.0.0.1:8470"
+
+# Object storage URL backing all repository data.
+storage_url = "file://./miscreant-data"
+
+# Blob contents at or below this many bytes are stored inline in SlateDB;
+# larger blobs are offloaded to object storage.
+inline_threshold = 65536
+
+# Create unknown repositories on first push.
+auto_create_repos = true
+
+# Local directory for per-request pack staging. The built-in default is the
+# system temp directory joined with "miscreant-staging"; shown here for a
+# typical Linux host.
+staging_root = "/tmp/miscreant-staging"
+
+# tracing-subscriber EnvFilter directive used when RUST_LOG is unset; RUST_LOG
+# always overrides this.
+log_filter = "info"
