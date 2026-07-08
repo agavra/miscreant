@@ -1,8 +1,12 @@
 mod common;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use common::{TestServer, commit_file, git, git_ok, init_repo, rev_parse, test_config};
+use common::{
+    TestServer, commit_file, git, git_ok, init_repo, rev_objects, rev_parse, test_config,
+};
+use gix_object::Kind;
 
 /// Commit identity flags for the hermetic `git` helper.
 const IDENTITY: [&str; 4] = [
@@ -108,6 +112,44 @@ fn clone_repo(server: &TestServer, url: &str, name: &str) -> PathBuf {
 /// Assert `git fsck --full` finds nothing wrong in `dir`.
 fn assert_fsck_clean(dir: &Path) {
     git_ok(dir, &["fsck", "--full"]);
+}
+
+/// Like [`clone_repo`], but with extra `git clone` flags (e.g.
+/// `--filter=blob:none --no-checkout`) inserted before the URL.
+fn clone_repo_with(server: &TestServer, url: &str, name: &str, extra: &[&str]) -> PathBuf {
+    let clone_dir = server.tempdir().join(name);
+    let mut args = vec!["clone"];
+    args.extend_from_slice(extra);
+    let dir_str = clone_dir.to_str().expect("utf-8 clone path").to_owned();
+    args.push(url);
+    args.push(&dir_str);
+    let clone = git(server.tempdir(), &args);
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    clone_dir
+}
+
+/// Split `git rev-list --objects --missing=print` output into the oids
+/// present locally (`<oid> <path>`) and the oids reported missing
+/// (`?<oid>`).
+fn parse_missing(output: &[u8]) -> (HashSet<String>, HashSet<String>) {
+    let mut present = HashSet::new();
+    let mut missing = HashSet::new();
+    for line in String::from_utf8(output.to_vec())
+        .expect("utf-8 rev-list output")
+        .lines()
+    {
+        if let Some(oid) = line.strip_prefix('?') {
+            missing.insert(oid.to_owned());
+        } else {
+            let oid = line.split_whitespace().next().unwrap_or(line);
+            present.insert(oid.to_owned());
+        }
+    }
+    (present, missing)
 }
 
 // The `git` subprocess blocks its thread on HTTP the in-process server must
@@ -289,20 +331,23 @@ async fn should_err_not_our_ref_for_an_unknown_want() {
 }
 
 #[tokio::test]
-async fn should_err_for_a_filter_argument() {
+async fn should_err_for_an_unsupported_filter_argument() {
     // given
     let server = TestServer::spawn(test_config()).await;
     server.store().create_repo("proj").await.expect("create");
     let bogus = "f".repeat(40);
 
-    // when: a fetch requesting a partial clone filter
-    let body = fetch_body(&[&format!("want {bogus}"), "filter blob:none", "done"]);
+    // when: a fetch requesting a filter kind the server does not implement
+    let body = fetch_body(&[&format!("want {bogus}"), "filter tree:0", "done"]);
     let response = post_upload_pack(&server.base_url(), "proj", body).await;
 
     // then
     let text =
         String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8 body");
-    assert!(text.contains("ERR unsupported filter"), "body: {text}");
+    assert!(
+        text.contains("ERR unsupported filter: tree:0"),
+        "body: {text}"
+    );
 }
 
 #[tokio::test]
@@ -322,4 +367,75 @@ async fn should_err_when_fetch_names_no_wants() {
         text.contains("ERR fetch requires at least one want"),
         "body: {text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_clone_with_blob_none_filter_and_omit_every_blob() {
+    // given: two commits, so the history has two distinct blobs
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+    let blob_oids: Vec<String> = rev_objects(&local, &["HEAD"])
+        .into_iter()
+        .filter(|(_, kind, _)| *kind == Kind::Blob)
+        .map(|(oid, _, _)| oid.to_string())
+        .collect();
+    assert_eq!(blob_oids.len(), 2, "expected two distinct blobs");
+
+    // when: a partial clone that omits all blob content, without checkout
+    // (checkout would need to fault in blobs by arbitrary oid, which this
+    // server does not yet serve)
+    let clone_dir = clone_repo_with(
+        &server,
+        &url,
+        "clone",
+        &["--filter=blob:none", "--no-checkout"],
+    );
+
+    // then: every blob the clone would otherwise have is reported missing —
+    // git only reports this when the server actually honored the filter,
+    // since a server that silently ignored an unadvertised filter would have
+    // sent (and the client would have stored) every blob.
+    let (present, missing) = parse_missing(&git_ok(
+        &clone_dir,
+        &["rev-list", "--objects", "--missing=print", "HEAD"],
+    ));
+    for oid in &blob_oids {
+        assert!(missing.contains(oid), "expected {oid} missing: {missing:?}");
+        assert!(!present.contains(oid), "expected {oid} absent: {present:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_clone_with_blob_limit_filter_and_include_only_small_blobs() {
+    // given: a small blob (the fixture's `a.txt`) and a blob over 1KiB
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let small_oid = rev_parse(&local, "HEAD:a.txt");
+    let big: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    commit_file(&local, "big.bin", &big, "add big");
+    let big_oid = rev_parse(&local, "HEAD:big.bin");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when
+    let clone_dir = clone_repo_with(
+        &server,
+        &url,
+        "clone",
+        &["--filter=blob:limit=1k", "--no-checkout"],
+    );
+
+    // then: the small blob transferred, the large one was filtered out
+    let (present, missing) = parse_missing(&git_ok(
+        &clone_dir,
+        &["rev-list", "--objects", "--missing=print", "HEAD"],
+    ));
+    assert!(
+        present.contains(&small_oid),
+        "small blob present: {present:?}"
+    );
+    assert!(!missing.contains(&small_oid), "small blob not missing");
+    assert!(missing.contains(&big_oid), "big blob missing: {missing:?}");
+    assert!(!present.contains(&big_oid), "big blob not present");
 }

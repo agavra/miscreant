@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use crate::AppState;
 use crate::error::{self, Class, Classify};
 use crate::git::pack_out::{PackOutError, write_pack};
-use crate::git::walk::Walker;
+use crate::git::walk::{FilterSpec, Walker};
 use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
 use crate::storage::values::RefTarget;
@@ -160,7 +160,10 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
         Ok(selection) => selection,
         Err(err) => return error_response(&err),
     };
-    let collected = match walker.collect(&selection.to_send, &selection.common).await {
+    let collected = match walker
+        .collect(&selection.to_send, &selection.common, &parsed.filter)
+        .await
+    {
         Ok(collected) => collected,
         Err(err) => return error_response(&err),
     };
@@ -372,14 +375,17 @@ struct FetchArgs {
     done: bool,
     /// Suppress side-band progress messages.
     no_progress: bool,
+    /// The partial-clone filter restricting which blobs are sent.
+    filter: FilterSpec,
 }
 
 impl FetchArgs {
     /// Parse `fetch` argument lines. `thin-pack`, `ofs-delta`, and
     /// `include-tag` are accepted and ignored: the server only sends full
     /// (non-delta) entries, which every client accepts, and tag objects are
-    /// sent only for explicitly wanted tag refs. A `filter` argument or any
-    /// unrecognized argument is rejected with the returned `ERR` message.
+    /// sent only for explicitly wanted tag refs. A `filter` argument naming a
+    /// spec [`FilterSpec::parse`] does not recognize, or any other
+    /// unrecognized argument, is rejected with the returned `ERR` message.
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut parsed = FetchArgs::default();
         for arg in args {
@@ -391,8 +397,9 @@ impl FetchArgs {
                 let oid = ObjectId::from_hex(hex.as_bytes())
                     .map_err(|_| format!("invalid have: {hex}"))?;
                 parsed.haves.push(oid);
-            } else if arg == "filter" || arg.starts_with("filter ") {
-                return Err("unsupported filter".to_owned());
+            } else if let Some(spec) = arg.strip_prefix("filter ") {
+                parsed.filter =
+                    FilterSpec::parse(spec).ok_or_else(|| format!("unsupported filter: {spec}"))?;
             } else {
                 match arg.as_str() {
                     "done" => parsed.done = true,
@@ -831,12 +838,30 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_a_fetch_filter_argument() {
+    fn should_parse_a_blob_none_filter_argument() {
         // given/when
-        let err = FetchArgs::parse(&["filter blob:none".to_owned()]).unwrap_err();
+        let parsed = FetchArgs::parse(&["filter blob:none".to_owned()]).expect("parse args");
 
         // then
-        assert_eq!(err, "unsupported filter");
+        assert_eq!(parsed.filter, FilterSpec::BlobNone);
+    }
+
+    #[test]
+    fn should_parse_a_blob_limit_filter_argument() {
+        // given/when
+        let parsed = FetchArgs::parse(&["filter blob:limit=1k".to_owned()]).expect("parse args");
+
+        // then
+        assert_eq!(parsed.filter, FilterSpec::BlobLimit(1024));
+    }
+
+    #[test]
+    fn should_reject_an_unsupported_fetch_filter_argument() {
+        // given/when
+        let err = FetchArgs::parse(&["filter tree:0".to_owned()]).unwrap_err();
+
+        // then
+        assert_eq!(err, "unsupported filter: tree:0");
     }
 
     #[test]

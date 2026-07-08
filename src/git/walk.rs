@@ -73,6 +73,51 @@ pub enum WalkError {
     },
 }
 
+/// A partial-clone filter restricting which blobs [`Walker::collect`] adds to
+/// the send set. Commits, trees, and tag objects are never filtered — see
+/// `docs/0001-init.md` §Filters (partial clone).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterSpec {
+    /// No filter: every reachable object is collected.
+    #[default]
+    None,
+    /// Omit every blob.
+    BlobNone,
+    /// Include a blob only when its content size is at most the given limit,
+    /// read from the object record (inline header or pointer payload) —
+    /// never by fetching the blob's content.
+    BlobLimit(u64),
+}
+
+impl FilterSpec {
+    /// Parse the payload of a `filter <spec>` fetch argument (the text after
+    /// `filter `). Returns `None` for any filter kind other than `blob:none`
+    /// and `blob:limit=<n>` (tree-depth, sparse, and combined filters are not
+    /// implemented); the caller reports that back to the client as an
+    /// in-band protocol error naming the rejected spec.
+    pub fn parse(spec: &str) -> Option<Self> {
+        if spec == "blob:none" {
+            return Some(FilterSpec::BlobNone);
+        }
+        let limit = spec.strip_prefix("blob:limit=")?;
+        parse_unit_size(limit).map(FilterSpec::BlobLimit)
+    }
+}
+
+/// Parse a size with an optional single-character unit suffix (`k`/`m`/`g`,
+/// case-insensitive, base 1024) — the syntax `git`'s `blob:limit` filter
+/// accepts from the user and transmits verbatim in the `filter` fetch
+/// argument.
+fn parse_unit_size(s: &str) -> Option<u64> {
+    let (digits, multiplier) = match s.as_bytes().last()? {
+        b'k' | b'K' => (&s[..s.len() - 1], 1024u64),
+        b'm' | b'M' => (&s[..s.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
 /// The outcome of commit discovery (Phase I).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -292,10 +337,14 @@ impl Walker {
     /// walk prunes an entire subtree at the first tree the client already
     /// has and adds blobs only when they are absent from the have-set, so an
     /// incremental fetch is proportional to the diff, not the snapshot.
+    /// `filter` restricts which blobs are added on the want side (`blob:none`
+    /// also keeps blobs out of the have-set; see [`FilterSpec`]) — commits,
+    /// trees, and tags are always collected in full.
     pub async fn collect(
         &self,
         to_send: &[ObjectId],
         haves: &[ObjectId],
+        filter: &FilterSpec,
     ) -> Result<Vec<ObjectId>, WalkError> {
         let mut have_objects: HashSet<ObjectId> = HashSet::new();
         for have in haves {
@@ -307,7 +356,8 @@ impl Walker {
                 Err(WalkError::UnexpectedKind { oid, .. }) if oid == *have => continue,
                 Err(err) => return Err(err),
             };
-            self.expand_haves(info.root_tree, &mut have_objects).await?;
+            self.expand_haves(info.root_tree, &mut have_objects, filter)
+                .await?;
         }
 
         let mut objects = OrderedOidSet::default();
@@ -321,7 +371,7 @@ impl Walker {
                 Kind::Commit => {
                     objects.insert(*id);
                     let info = self.get_commit_info(id).await?;
-                    self.walk_tree(info.root_tree, &mut objects, &have_objects)
+                    self.walk_tree(info.root_tree, &mut objects, &have_objects, filter)
                         .await?;
                 }
                 Kind::Tag => objects.insert(*id),
@@ -513,10 +563,13 @@ impl Walker {
     /// `have_objects`. The set doubles as the seen-set, so a subtree shared
     /// between several haves is visited once and the total cost is bounded
     /// by the number of distinct objects reachable from the haves.
+    /// `FilterSpec::BlobNone` keeps blobs out of the have-set too — a filtered
+    /// have-side already has no blobs, so its have-set should not claim any.
     async fn expand_haves(
         &self,
         root_tree: ObjectId,
         have_objects: &mut HashSet<ObjectId>,
+        filter: &FilterSpec,
     ) -> Result<(), WalkError> {
         let mut stack = vec![root_tree];
         while let Some(tree_id) = stack.pop() {
@@ -531,7 +584,9 @@ impl Walker {
                         }
                     }
                     TreeEntry::Leaf(child) => {
-                        have_objects.insert(child);
+                        if !matches!(filter, FilterSpec::BlobNone) {
+                            have_objects.insert(child);
+                        }
                     }
                 }
             }
@@ -544,12 +599,15 @@ impl Walker {
     /// identical tree id implies identical content all the way down, so the
     /// walk prunes a whole subtree at the first tree found in `have_objects`
     /// (or already collected — `objects` memoizes trees shared between the
-    /// commits being sent).
+    /// commits being sent). Trees are always collected in full; `filter`
+    /// decides which of the remaining blobs are admitted (see
+    /// [`Walker::include_blob`]).
     async fn walk_tree(
         &self,
         root_tree: ObjectId,
         objects: &mut OrderedOidSet,
         have_objects: &HashSet<ObjectId>,
+        filter: &FilterSpec,
     ) -> Result<(), WalkError> {
         let mut stack = vec![root_tree];
         while let Some(tree_id) = stack.pop() {
@@ -562,9 +620,12 @@ impl Walker {
                 match entry {
                     TreeEntry::Subtree(child) => subtrees.push(child),
                     // The sole blob admission point: a blob is sent only
-                    // when the client's have-frontier lacks it.
+                    // when the client's have-frontier lacks it and the
+                    // filter admits it.
                     TreeEntry::Leaf(child) => {
-                        if !have_objects.contains(&child) {
+                        if !have_objects.contains(&child)
+                            && self.include_blob(child, filter).await?
+                        {
                             objects.insert(child);
                         }
                     }
@@ -577,6 +638,24 @@ impl Walker {
             }
         }
         Ok(())
+    }
+
+    /// Whether `filter` admits blob `id` into the send set. `BlobLimit`
+    /// decides from [`ObjectDb::size`] alone — the object record's inline
+    /// header or pointer payload — and never fetches the blob's content.
+    async fn include_blob(&self, id: ObjectId, filter: &FilterSpec) -> Result<bool, WalkError> {
+        match *filter {
+            FilterSpec::None => Ok(true),
+            FilterSpec::BlobNone => Ok(false),
+            FilterSpec::BlobLimit(limit) => {
+                let (_, size) = self
+                    .objects
+                    .size(self.repo, &id)
+                    .await?
+                    .ok_or(WalkError::MissingObject(id))?;
+                Ok(size <= limit)
+            }
+        }
     }
 
     /// Read and parse a tree object into walk-relevant entries, dropping
@@ -619,6 +698,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::BlobStore;
+    use crate::storage::values::ObjectRecord;
 
     /// A walker over a fresh `memory://` store with one repository.
     async fn walker() -> Walker {
@@ -922,7 +1002,10 @@ mod tests {
         assert_eq!(selection.to_send, vec![commits[1], commits[0], tag2, tag1]);
 
         // when: collecting the selection.
-        let collected = w.collect(&selection.to_send, &[]).await.expect("collect");
+        let collected = w
+            .collect(&selection.to_send, &[], &FilterSpec::None)
+            .await
+            .expect("collect");
 
         // then: both tag objects are in the packed set exactly once, next
         // to the full commit closure (2 commits + 2 trees + 2 blobs).
@@ -944,7 +1027,10 @@ mod tests {
         let c2 = commit(&w, t2, &[c1], "two").await;
 
         // when: collecting with no haves (a clone).
-        let collected = w.collect(&[c2, c1], &[]).await.expect("collect");
+        let collected = w
+            .collect(&[c2, c1], &[], &FilterSpec::None)
+            .await
+            .expect("collect");
 
         // then: exactly the six objects, commits leading their snapshots.
         assert_eq!(collected, vec![c2, t2, b2, c1, t1, b1]);
@@ -998,7 +1084,7 @@ mod tests {
         // when: an incremental fetch of c2 with c1 as the have.
         let selection = w.select_commits(&[c2], &[c1]).await.expect("select");
         let collected = w
-            .collect(&selection.to_send, &selection.common)
+            .collect(&selection.to_send, &selection.common, &FilterSpec::None)
             .await
             .expect("collect");
 
@@ -1062,7 +1148,10 @@ mod tests {
         let c2 = commit(&w, root2, &[c1], "two").await;
 
         // when
-        let collected = w.collect(&[c2], &[c1]).await.expect("collect");
+        let collected = w
+            .collect(&[c2], &[c1], &FilterSpec::None)
+            .await
+            .expect("collect");
 
         // then: even though the root tree changed, only the changed spine
         // (commit, three rewritten trees, one new blob) is collected.
@@ -1176,5 +1265,156 @@ mod tests {
         // pack. Over-serving c2 is acceptable; dropping a want is not.
         assert_eq!(as_set(&selection.to_send), as_set(&[c2, c1, d1]));
         assert_eq!(selection.common, vec![c3]);
+    }
+
+    #[test]
+    fn should_default_to_no_filter_when_absent() {
+        // given/when/then
+        assert_eq!(FilterSpec::default(), FilterSpec::None);
+    }
+
+    #[test]
+    fn should_parse_blob_none() {
+        // given/when
+        let parsed = FilterSpec::parse("blob:none").expect("parse");
+
+        // then
+        assert_eq!(parsed, FilterSpec::BlobNone);
+    }
+
+    #[test]
+    fn should_parse_a_plain_blob_limit() {
+        // given/when
+        let parsed = FilterSpec::parse("blob:limit=1024").expect("parse");
+
+        // then
+        assert_eq!(parsed, FilterSpec::BlobLimit(1024));
+    }
+
+    #[test]
+    fn should_parse_blob_limit_unit_suffixes() {
+        // given/when/then: git accepts k/m/g (either case), base 1024.
+        assert_eq!(
+            FilterSpec::parse("blob:limit=1k").expect("k"),
+            FilterSpec::BlobLimit(1024)
+        );
+        assert_eq!(
+            FilterSpec::parse("blob:limit=1K").expect("K"),
+            FilterSpec::BlobLimit(1024)
+        );
+        assert_eq!(
+            FilterSpec::parse("blob:limit=2m").expect("m"),
+            FilterSpec::BlobLimit(2 * 1024 * 1024)
+        );
+        assert_eq!(
+            FilterSpec::parse("blob:limit=1g").expect("g"),
+            FilterSpec::BlobLimit(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn should_reject_unsupported_filter_specs() {
+        // given/when/then: filter kinds the walk does not implement.
+        for spec in ["tree:0", "sparse:oid=abc123", "combine:blob:none+tree:1"] {
+            assert_eq!(FilterSpec::parse(spec), None, "spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn should_reject_a_blob_limit_with_no_digits() {
+        // given/when/then
+        assert_eq!(FilterSpec::parse("blob:limit=k"), None);
+        assert_eq!(FilterSpec::parse("blob:limit="), None);
+    }
+
+    #[tokio::test]
+    async fn should_collect_zero_blobs_but_all_trees_and_commits_with_blob_none() {
+        // given: two commits with distinct trees and blobs.
+        let w = walker().await;
+        let b1 = blob(&w, b"one").await;
+        let t1 = tree(&w, &[(EntryKind::Blob, "file.txt", b1)]).await;
+        let c1 = commit(&w, t1, &[], "one").await;
+        let b2 = blob(&w, b"two").await;
+        let t2 = tree(&w, &[(EntryKind::Blob, "file.txt", b2)]).await;
+        let c2 = commit(&w, t2, &[c1], "two").await;
+
+        // when
+        let collected = w
+            .collect(&[c2, c1], &[], &FilterSpec::BlobNone)
+            .await
+            .expect("collect");
+
+        // then: every commit and tree rides along; neither blob does.
+        assert_eq!(as_set(&collected), as_set(&[c2, t2, c1, t1]));
+        assert!(!collected.contains(&b1));
+        assert!(!collected.contains(&b2));
+    }
+
+    #[tokio::test]
+    async fn should_include_only_blobs_at_or_under_the_limit() {
+        // given: one commit whose tree has a small blob and a larger one.
+        let w = walker().await;
+        let small = blob(&w, b"tiny").await; // 4 bytes
+        let big = blob(&w, b"this content is over the limit").await; // 31 bytes
+        let root = tree(
+            &w,
+            &[
+                (EntryKind::Blob, "small.txt", small),
+                (EntryKind::Blob, "big.txt", big),
+            ],
+        )
+        .await;
+        let c = commit(&w, root, &[], "one").await;
+
+        // when: a limit that admits the small blob but not the big one.
+        let collected = w
+            .collect(&[c], &[], &FilterSpec::BlobLimit(10))
+            .await
+            .expect("collect");
+
+        // then
+        assert_eq!(as_set(&collected), as_set(&[c, root, small]));
+    }
+
+    #[tokio::test]
+    async fn should_check_offloaded_blob_size_without_reading_blob_content() {
+        // given: a tree with a real small blob and a "phantom" blob whose
+        // object record is a bare BlobPointer with no matching content ever
+        // written to the blob store (as if only its size were durable).
+        // Fetching the phantom's content would fail; a size-based filter
+        // must never attempt it.
+        let w = walker().await;
+        let small = blob(&w, b"tiny").await;
+        let phantom = ObjectId::from_hex(&[b'5'; 40]).expect("valid hex");
+        w.store
+            .put_object(
+                w.repo,
+                &phantom,
+                &ObjectRecord::BlobPointer { size: 1_000_000 },
+                Durability::Durable,
+            )
+            .await
+            .expect("seed phantom pointer record");
+        let root = tree(
+            &w,
+            &[
+                (EntryKind::Blob, "small.txt", small),
+                (EntryKind::Blob, "phantom.bin", phantom),
+            ],
+        )
+        .await;
+        let c = commit(&w, root, &[], "one").await;
+
+        // when: a limit that admits the small blob but not the phantom's
+        // declared size.
+        let collected = w
+            .collect(&[c], &[], &FilterSpec::BlobLimit(10))
+            .await
+            .expect("collect");
+
+        // then: the phantom is excluded by its declared size alone — had the
+        // walk instead fetched its content, this would have failed with a
+        // blob-store lookup error rather than returning successfully.
+        assert_eq!(as_set(&collected), as_set(&[c, root, small]));
     }
 }

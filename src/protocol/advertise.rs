@@ -24,18 +24,19 @@ pub fn agent() -> String {
 /// Build the protocol-v2 upload-pack capability advertisement.
 ///
 /// Layout: `# service=git-upload-pack\n` then a flush, then one pkt-line per
-/// capability (`version 2`, `agent=…`, `ls-refs=unborn`, `fetch`,
+/// capability (`version 2`, `agent=…`, `ls-refs=unborn`, `fetch=filter`,
 /// `object-format=sha1`), terminated by a flush. The `unborn` value on
-/// `ls-refs` tells clients the server understands the `unborn` argument, so
-/// they know it is safe to send it (git only sends `unborn` when the server
-/// advertises support for it).
+/// `ls-refs` tells clients the server understands the `unborn` argument, and
+/// the `filter` value on `fetch` tells them the server understands the
+/// `filter` argument — clients only send either argument when the server
+/// advertises support for it.
 pub fn upload_pack(out: &mut Vec<u8>) -> io::Result<()> {
     encode::data_to_write(b"# service=git-upload-pack\n", &mut *out)?;
     encode::flush_to_write(&mut *out)?;
     encode::data_to_write(b"version 2\n", &mut *out)?;
     encode::data_to_write(format!("agent={}\n", agent()).as_bytes(), &mut *out)?;
     encode::data_to_write(b"ls-refs=unborn\n", &mut *out)?;
-    encode::data_to_write(b"fetch\n", &mut *out)?;
+    encode::data_to_write(b"fetch=filter\n", &mut *out)?;
     encode::data_to_write(b"object-format=sha1\n", &mut *out)?;
     encode::flush_to_write(&mut *out)?;
     Ok(())
