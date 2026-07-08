@@ -240,18 +240,21 @@ async fn should_route_git_suffix_and_nested_names_to_the_same_repo() {
 }
 
 #[tokio::test]
-async fn should_return_501_for_the_stubbed_upload_pack_rpc_endpoint() {
+async fn should_reject_upload_pack_rpc_without_protocol_v2() {
     // given
     let server = TestServer::spawn(test_config()).await;
 
-    // when/then: fetch negotiation is still stubbed (push is served).
+    // when: the upload-pack RPC is served only for protocol v2, so a POST
+    // without the Git-Protocol header is refused before it is even parsed.
     let response = reqwest::Client::new()
         .post(format!("{}/some/repo/git-upload-pack", server.base_url()))
         .body("")
         .send()
         .await
         .expect("send request");
-    assert_eq!(response.status(), 501);
+
+    // then
+    assert_eq!(response.status(), 400);
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
 }
 
@@ -323,22 +326,17 @@ async fn should_serve_an_upload_advertisement_a_real_client_accepts() {
     let url = format!("{}/empty/repo.git", server.base_url());
     let out = git(server.tempdir(), &["ls-remote", &url]);
 
-    // then: the client accepted the advertisement and progressed to the pack
-    // RPC, where it hits the (still-stubbed) 501. See NOTE in the report and
-    // issues.md: with v2-only upload-pack, ls-remote cannot list refs until
-    // `ls-refs` is implemented, so an exit-0/no-refs assertion is impossible
-    // while POST is stubbed.
+    // then: the handshake and command succeed. An empty repository has only an
+    // unborn HEAD (a symref to a branch that does not exist yet), which ls-refs
+    // omits, so the client lists no refs and still exits 0.
     assert!(
-        !out.status.success(),
-        "ls-remote unexpectedly succeeded against a stubbed pack RPC"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
+        out.status.success(),
+        "ls-remote failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        combined.contains("501"),
-        "expected the advertisement to be accepted and the POST to 501, got: {combined}"
+        out.stdout.is_empty(),
+        "expected no refs from an empty repository, got: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }

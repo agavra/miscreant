@@ -3,8 +3,7 @@
 //! See `docs/0001-init.md` §Transfer Protocol (path scheme, v2-only fetch),
 //! §Fetch API (capability list), and §Receive API (discovery). Repositories
 //! are addressed by the request path minus the endpoint suffix. The push RPC
-//! is served by `receive_pack`; the fetch RPC is stubbed until upload-pack
-//! lands.
+//! is served by `receive_pack`; the fetch RPC by `upload_pack`.
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -12,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
 use crate::AppState;
-use crate::protocol::{advertise, receive_pack};
+use crate::protocol::{advertise, receive_pack, upload_pack};
 
 /// Endpoint suffix for a ref-advertisement request.
 const INFO_REFS: &str = "info/refs";
@@ -56,14 +55,13 @@ pub async fn info_refs(
     }
 }
 
-/// `POST /<repo>/git-upload-pack` and `POST /<repo>/git-receive-pack`.
-///
-/// Receive-pack (push) is served here; upload-pack (fetch negotiation) is not
-/// implemented yet, so a client that completes discovery and then tries to
-/// fetch reaches its stub.
+/// `POST /<repo>/git-upload-pack` and `POST /<repo>/git-receive-pack` — the
+/// push and fetch RPCs. Each strips its endpoint suffix to recover the
+/// repository name and hands off to the matching handler.
 pub async fn git_rpc(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Some(prefix) = strip_endpoint(&path, RECEIVE_PACK) {
@@ -72,8 +70,12 @@ pub async fn git_rpc(
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
         receive_pack::receive_pack(&state, &repo, body).await
-    } else if strip_endpoint(&path, UPLOAD_PACK).is_some() {
-        plain(StatusCode::NOT_IMPLEMENTED, "not implemented")
+    } else if let Some(prefix) = strip_endpoint(&path, UPLOAD_PACK) {
+        let repo = match repo_name(prefix) {
+            Ok(name) => name,
+            Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
+        };
+        upload_pack::upload_pack(&state, &repo, &headers, body).await
     } else {
         plain(StatusCode::NOT_FOUND, "not found")
     }
@@ -181,7 +183,7 @@ fn service_param(query: Option<&str>) -> Option<String> {
 }
 
 /// Whether the request opts into protocol v2 via the `Git-Protocol` header.
-fn wants_v2(headers: &HeaderMap) -> bool {
+pub(crate) fn wants_v2(headers: &HeaderMap) -> bool {
     headers
         .get("git-protocol")
         .and_then(|value| value.to_str().ok())
