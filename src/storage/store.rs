@@ -737,9 +737,24 @@ impl Store {
 /// Resolve the storage URL into a root object store already offset by the
 /// URL's path component. SlateDB and blob offload build their prefixes on top.
 /// Supports `file://`, `memory://`, and `s3://` (see `object_store::parse_url`).
+///
+/// `s3://` stores are built from the `AWS_*` environment (region, endpoint,
+/// credentials — falling back to instance-profile metadata), which
+/// `object_store::parse_url` alone would ignore: it constructs a client with
+/// default options, whose `us-east-1` default region makes every request to a
+/// bucket in any other region fail on an unfollowed 301 redirect.
 fn resolve_root_store(storage_url: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
     let url = Url::parse(storage_url)?;
-    let (store, path) = object_store::parse_url(&url)?;
+    let (store, path) = if url.scheme() == "s3" {
+        let store = object_store::aws::AmazonS3Builder::from_env()
+            .with_url(url.as_str())
+            .build()?;
+        let path =
+            object_store::path::Path::parse(url.path()).map_err(object_store::Error::from)?;
+        (Box::new(store) as Box<dyn ObjectStore>, path)
+    } else {
+        object_store::parse_url(&url)?
+    };
     let store: Arc<dyn ObjectStore> = Arc::from(store);
     if path.as_ref().is_empty() {
         Ok(store)
