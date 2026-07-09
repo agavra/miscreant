@@ -22,7 +22,7 @@ async fn memory_backend(repo_name: &str) -> (Store, ObjectDb, RepoMeta) {
     let store = Store::open("memory://").await.expect("open store");
     let meta = store.create_repo(repo_name).await.expect("create repo");
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let objectdb = ObjectDb::new(store.clone(), BlobStore::new(backing), 65536);
+    let objectdb = ObjectDb::new(store.clone(), BlobStore::new(backing), 65536, 6);
     (store, objectdb, meta)
 }
 
@@ -31,7 +31,7 @@ async fn memory_backend(repo_name: &str) -> (Store, ObjectDb, RepoMeta) {
 /// so blob-store identity across a reopen is irrelevant).
 fn object_db_over(store: &Store) -> ObjectDb {
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    ObjectDb::new(store.clone(), BlobStore::new(backing), 65536)
+    ObjectDb::new(store.clone(), BlobStore::new(backing), 65536, 6)
 }
 
 /// A scratch area holding a fixture repository and a staging root.

@@ -9,6 +9,7 @@ pub mod objectdb;
 pub mod slatedb_metrics;
 pub mod store;
 pub mod values;
+pub mod zlib;
 
 pub use blobs::{BlobStore, BlobStoreError};
 pub use objectdb::{ObjectDb, ObjectDbError};

@@ -38,6 +38,12 @@ cache_disk_bytes = 34359738368
 # so the first request is served hot. Requires cache_dir.
 warm_on_start = false
 
+# zlib level (0-9) at which object content is deflated when written. Higher
+# levels shrink stored objects (and the packs served from them) at the cost of
+# more CPU at write time; inflate is level-agnostic, so this never affects
+# reads.
+object_compression_level = 6
+
 # tracing-subscriber EnvFilter directive used when RUST_LOG is unset; RUST_LOG
 # always overrides this.
 log_filter = "info"

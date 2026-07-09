@@ -37,7 +37,7 @@ use tracing::{Instrument, Span};
 
 use crate::AppState;
 use crate::error::{self, Class, Classify};
-use crate::git::pack_out::{PackOutError, write_pack};
+use crate::git::pack_out::{PackEntry, PackOutError, write_pack};
 use crate::git::walk::{FilterSpec, WalkError, Walker};
 use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
@@ -336,25 +336,31 @@ fn negotiation_prefix(done: bool, common: &[ObjectId]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Read each collected object's kind and body from the object database with
-/// up to [`OBJECT_LOOKAHEAD`] lookups in flight, forwarding results to the
-/// pack writer in collected order. Stops at the first failure (forwarded so
-/// the writer can report it) or when the writer hangs up.
+/// Read each collected object's stored zlib stream from the object database
+/// with up to [`OBJECT_LOOKAHEAD`] lookups in flight, forwarding ready-to-pack
+/// entries to the pack writer in collected order. Nothing is inflated: the
+/// stored streams are what the pack copies out. Stops at the first failure
+/// (forwarded so the writer can report it) or when the writer hangs up.
 async fn feed_objects(
     objectdb: ObjectDb,
     repo: RepoId,
     oids: Vec<ObjectId>,
-    tx: mpsc::Sender<Result<(ObjectId, Kind, Bytes), FetchObjectError>>,
+    tx: mpsc::Sender<Result<PackEntry, FetchObjectError>>,
 ) {
     let mut lookups = stream::iter(oids)
         .map(|oid| {
             let objectdb = objectdb.clone();
-            async move { (oid, objectdb.get(repo, &oid).await) }
+            async move { (oid, objectdb.read_compressed(repo, &oid).await) }
         })
         .buffered(OBJECT_LOOKAHEAD);
     while let Some((oid, result)) = lookups.next().await {
         let item = match result {
-            Ok(Some((kind, body))) => Ok((oid, kind, body)),
+            Ok(Some((kind, decompressed_size, zlib))) => Ok(PackEntry {
+                id: oid,
+                kind,
+                decompressed_size,
+                zlib,
+            }),
             Ok(None) => Err(FetchObjectError::Missing(oid)),
             Err(err) => Err(FetchObjectError::Objects(err)),
         };
@@ -365,9 +371,10 @@ async fn feed_objects(
     }
 }
 
-/// The blocking half of the fetch response: pull looked-up objects from
-/// `objects`, compress them into pack entries, and send the pack out on
-/// `body`. With `sideband` set the pack is multiplexed as side-band channel-1
+/// The blocking half of the fetch response: pull ready-to-pack entries from
+/// `objects`, write them into the pack (copying each stored zlib stream
+/// verbatim — nothing is compressed here), and send the pack out on `body`.
+/// With `sideband` set the pack is multiplexed as side-band channel-1
 /// packets, with progress on channel 2 (unless suppressed) and a flush pkt
 /// closing a successful response, and a failure after streaming has begun is
 /// reported on channel 3 — the only remaining path to the client — except
@@ -376,7 +383,7 @@ async fn feed_objects(
 /// failure then has no in-band channel and leaves the client a truncated pack
 /// to reject.
 fn stream_pack(
-    mut objects: mpsc::Receiver<Result<(ObjectId, Kind, Bytes), FetchObjectError>>,
+    mut objects: mpsc::Receiver<Result<PackEntry, FetchObjectError>>,
     body: mpsc::Sender<Bytes>,
     count: u32,
     object_hash: gix_hash::Kind,

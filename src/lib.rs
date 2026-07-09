@@ -62,7 +62,12 @@ impl AppState {
         };
         let store = Store::open_with_cache(&storage_url, &cache).await?;
         let blobs = BlobStore::new(store.object_store());
-        let objectdb = ObjectDb::new(store.clone(), blobs, config.inline_threshold);
+        let objectdb = ObjectDb::new(
+            store.clone(),
+            blobs,
+            config.inline_threshold,
+            config.object_compression_level,
+        );
         Ok(Self {
             config: Arc::new(config),
             store,

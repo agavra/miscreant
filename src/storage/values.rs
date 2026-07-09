@@ -3,9 +3,14 @@
 //! Every value begins with a one-byte tag identifying how to interpret the
 //! remaining bytes. See `docs/0001-init.md` §Storage for the per-segment
 //! Value Layout tables, and this repo's "Fixed decisions" for the
-//! clarifications binding here (big-endian integers throughout; blob-inline
-//! keeps its canonical git header, tree/commit/tag records store body-only
-//! bytes).
+//! clarifications binding here (big-endian integers throughout).
+//!
+//! An object record's tag carries the git object kind, so kind and size are
+//! readable without inflating anything. Every inline object payload is the
+//! object's content-length (a big-endian `u64`) followed by the zlib stream of
+//! its bare content — no git `<type> <size>\0` header, matching what a pack
+//! entry carries. This module only frames those bytes; the zlib codec lives in
+//! [`crate::storage::zlib`].
 
 use bytes::Bytes;
 use gix_hash::ObjectId;
@@ -109,87 +114,106 @@ impl MetaValue {
     }
 }
 
-/// An object-segment value: a git object's storage record.
+/// An object-segment value: a git object's storage record. Every inline
+/// variant carries the object's uncompressed content length plus the zlib
+/// stream of its bare content (no `<type> <size>\0` header); the tag names the
+/// kind, so both kind and size are available without inflating.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectRecord {
-    /// A blob stored inline, as the canonical git encoding `<type>
-    /// <size>\0<content>` (header included).
-    BlobInline(Bytes),
-    /// A blob offloaded to object storage under `blobs/<xx>/<rest>`; the
-    /// payload carries only its content size, so size queries never need an
-    /// object-storage round trip.
+    /// A blob stored inline.
+    BlobInline {
+        /// The blob's content size in bytes.
+        uncompressed_len: u64,
+        /// The zlib stream of the blob's content.
+        zlib: Bytes,
+    },
+    /// A blob offloaded to object storage under `blobs/<xx>/<rest>`, where its
+    /// content lives as a zlib stream. The payload carries only its content
+    /// size, so size queries never need an object-storage round trip.
     BlobPointer {
         /// The blob's content size in bytes.
         size: u64,
     },
-    /// A tree object's body (no `<type> <size>\0` header).
-    Tree(Bytes),
-    /// A commit object's body (no `<type> <size>\0` header).
-    Commit(Bytes),
-    /// A tag object's body (no `<type> <size>\0` header).
-    Tag(Bytes),
+    /// A tree object.
+    Tree {
+        /// The tree's content size in bytes.
+        uncompressed_len: u64,
+        /// The zlib stream of the tree's body.
+        zlib: Bytes,
+    },
+    /// A commit object.
+    Commit {
+        /// The commit's content size in bytes.
+        uncompressed_len: u64,
+        /// The zlib stream of the commit's body.
+        zlib: Bytes,
+    },
+    /// A tag object.
+    Tag {
+        /// The tag's content size in bytes.
+        uncompressed_len: u64,
+        /// The zlib stream of the tag's body.
+        zlib: Bytes,
+    },
 }
 
 impl ObjectRecord {
     /// The `gix_object::Kind` this record represents.
     pub fn kind(&self) -> ObjectKind {
         match self {
-            ObjectRecord::BlobInline(_) | ObjectRecord::BlobPointer { .. } => ObjectKind::Blob,
-            ObjectRecord::Tree(_) => ObjectKind::Tree,
-            ObjectRecord::Commit(_) => ObjectKind::Commit,
-            ObjectRecord::Tag(_) => ObjectKind::Tag,
+            ObjectRecord::BlobInline { .. } | ObjectRecord::BlobPointer { .. } => ObjectKind::Blob,
+            ObjectRecord::Tree { .. } => ObjectKind::Tree,
+            ObjectRecord::Commit { .. } => ObjectKind::Commit,
+            ObjectRecord::Tag { .. } => ObjectKind::Tag,
         }
     }
 
     /// The object's content size in bytes. Never touches the blob content
-    /// store: pointer records carry their size in the payload, and
-    /// tree/commit/tag records store body-only bytes whose length *is* the
-    /// size.
+    /// store and never inflates: every variant carries its uncompressed
+    /// content length in the record itself.
     pub fn size(&self) -> u64 {
         match self {
-            ObjectRecord::BlobInline(bytes) => gix_object::decode::loose_header(bytes)
-                .map(|(_, size, _)| size)
-                .unwrap_or(0),
             ObjectRecord::BlobPointer { size } => *size,
-            ObjectRecord::Tree(bytes) | ObjectRecord::Commit(bytes) | ObjectRecord::Tag(bytes) => {
-                bytes.len() as u64
+            ObjectRecord::BlobInline {
+                uncompressed_len, ..
             }
+            | ObjectRecord::Tree {
+                uncompressed_len, ..
+            }
+            | ObjectRecord::Commit {
+                uncompressed_len, ..
+            }
+            | ObjectRecord::Tag {
+                uncompressed_len, ..
+            } => *uncompressed_len,
         }
     }
 
     /// Encode this record as `object_tag | payload`.
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            ObjectRecord::BlobInline(bytes) => {
-                let mut buf = Vec::with_capacity(1 + bytes.len());
-                buf.push(0x01);
-                buf.extend_from_slice(bytes);
-                buf
-            }
+            ObjectRecord::BlobInline {
+                uncompressed_len,
+                zlib,
+            } => encode_compressed(0x01, *uncompressed_len, zlib),
             ObjectRecord::BlobPointer { size } => {
                 let mut buf = Vec::with_capacity(1 + 8);
                 buf.push(0x02);
                 buf.extend_from_slice(&size.to_be_bytes());
                 buf
             }
-            ObjectRecord::Tree(bytes) => {
-                let mut buf = Vec::with_capacity(1 + bytes.len());
-                buf.push(0x03);
-                buf.extend_from_slice(bytes);
-                buf
-            }
-            ObjectRecord::Commit(bytes) => {
-                let mut buf = Vec::with_capacity(1 + bytes.len());
-                buf.push(0x04);
-                buf.extend_from_slice(bytes);
-                buf
-            }
-            ObjectRecord::Tag(bytes) => {
-                let mut buf = Vec::with_capacity(1 + bytes.len());
-                buf.push(0x05);
-                buf.extend_from_slice(bytes);
-                buf
-            }
+            ObjectRecord::Tree {
+                uncompressed_len,
+                zlib,
+            } => encode_compressed(0x03, *uncompressed_len, zlib),
+            ObjectRecord::Commit {
+                uncompressed_len,
+                zlib,
+            } => encode_compressed(0x04, *uncompressed_len, zlib),
+            ObjectRecord::Tag {
+                uncompressed_len,
+                zlib,
+            } => encode_compressed(0x05, *uncompressed_len, zlib),
         }
     }
 
@@ -197,7 +221,13 @@ impl ObjectRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, ValueError> {
         let (&tag, rest) = bytes.split_first().ok_or(ValueError::Empty)?;
         match tag {
-            0x01 => Ok(ObjectRecord::BlobInline(Bytes::copy_from_slice(rest))),
+            0x01 => {
+                let (uncompressed_len, zlib) = decode_compressed(rest)?;
+                Ok(ObjectRecord::BlobInline {
+                    uncompressed_len,
+                    zlib,
+                })
+            }
             0x02 => match rest.len().cmp(&8) {
                 std::cmp::Ordering::Less => Err(ValueError::Truncated),
                 std::cmp::Ordering::Equal => Ok(ObjectRecord::BlobPointer {
@@ -205,12 +235,51 @@ impl ObjectRecord {
                 }),
                 std::cmp::Ordering::Greater => Err(ValueError::TrailingBytes),
             },
-            0x03 => Ok(ObjectRecord::Tree(Bytes::copy_from_slice(rest))),
-            0x04 => Ok(ObjectRecord::Commit(Bytes::copy_from_slice(rest))),
-            0x05 => Ok(ObjectRecord::Tag(Bytes::copy_from_slice(rest))),
+            0x03 => {
+                let (uncompressed_len, zlib) = decode_compressed(rest)?;
+                Ok(ObjectRecord::Tree {
+                    uncompressed_len,
+                    zlib,
+                })
+            }
+            0x04 => {
+                let (uncompressed_len, zlib) = decode_compressed(rest)?;
+                Ok(ObjectRecord::Commit {
+                    uncompressed_len,
+                    zlib,
+                })
+            }
+            0x05 => {
+                let (uncompressed_len, zlib) = decode_compressed(rest)?;
+                Ok(ObjectRecord::Tag {
+                    uncompressed_len,
+                    zlib,
+                })
+            }
             other => Err(ValueError::UnknownTag(other)),
         }
     }
+}
+
+/// Frame an inline object payload: `tag | uncompressed_len (u64 BE) | zlib`.
+fn encode_compressed(tag: u8, uncompressed_len: u64, zlib: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + zlib.len());
+    buf.push(tag);
+    buf.extend_from_slice(&uncompressed_len.to_be_bytes());
+    buf.extend_from_slice(zlib);
+    buf
+}
+
+/// Split an inline object payload (the bytes after the tag) into its
+/// uncompressed length and zlib stream. The stream itself may be empty (an
+/// empty object still deflates to a non-empty stream, but a truncated record
+/// might not), so only the fixed-width length prefix is length-checked.
+fn decode_compressed(rest: &[u8]) -> Result<(u64, Bytes), ValueError> {
+    if rest.len() < 8 {
+        return Err(ValueError::Truncated);
+    }
+    let uncompressed_len = read_u64_be(&rest[..8]);
+    Ok((uncompressed_len, Bytes::copy_from_slice(&rest[8..])))
 }
 
 /// A ref-segment value: what a ref name points at.
@@ -452,14 +521,25 @@ mod tests {
 
     // --- ObjectRecord ---
 
+    /// The zlib stream of `content` at the default level, for building record
+    /// fixtures whose payload is a real (inflatable) stream.
+    fn zlib(content: &[u8]) -> Bytes {
+        Bytes::from(crate::storage::zlib::deflate(content, 6))
+    }
+
     #[test]
     fn should_encode_blob_inline_record_bytes_exactly() {
         // given/when
-        let record = ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello"));
+        let stream = zlib(b"hello");
+        let record = ObjectRecord::BlobInline {
+            uncompressed_len: 5,
+            zlib: stream.clone(),
+        };
 
-        // then
+        // then: tag, the big-endian content length, then the zlib stream
         let mut expected = vec![0x01u8];
-        expected.extend_from_slice(b"blob 5\0hello");
+        expected.extend_from_slice(&5u64.to_be_bytes());
+        expected.extend_from_slice(&stream);
         assert_eq!(record.encode(), expected);
         assert_eq!(record.kind(), ObjectKind::Blob);
         assert_eq!(record.size(), 5);
@@ -481,26 +561,34 @@ mod tests {
     #[test]
     fn should_encode_tree_record_bytes_exactly() {
         // given/when
-        let body = Bytes::from_static(b"tree-body-bytes");
-        let record = ObjectRecord::Tree(body.clone());
+        let stream = zlib(b"tree-body-bytes");
+        let record = ObjectRecord::Tree {
+            uncompressed_len: 15,
+            zlib: stream.clone(),
+        };
 
         // then
         let mut expected = vec![0x03u8];
-        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&15u64.to_be_bytes());
+        expected.extend_from_slice(&stream);
         assert_eq!(record.encode(), expected);
         assert_eq!(record.kind(), ObjectKind::Tree);
-        assert_eq!(record.size(), body.len() as u64);
+        assert_eq!(record.size(), 15);
     }
 
     #[test]
     fn should_encode_commit_record_bytes_exactly() {
         // given/when
-        let body = Bytes::from_static(b"commit-body-bytes");
-        let record = ObjectRecord::Commit(body.clone());
+        let stream = zlib(b"commit-body-bytes");
+        let record = ObjectRecord::Commit {
+            uncompressed_len: 17,
+            zlib: stream.clone(),
+        };
 
         // then
         let mut expected = vec![0x04u8];
-        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&17u64.to_be_bytes());
+        expected.extend_from_slice(&stream);
         assert_eq!(record.encode(), expected);
         assert_eq!(record.kind(), ObjectKind::Commit);
     }
@@ -508,12 +596,16 @@ mod tests {
     #[test]
     fn should_encode_tag_record_bytes_exactly() {
         // given/when
-        let body = Bytes::from_static(b"tag-body-bytes");
-        let record = ObjectRecord::Tag(body.clone());
+        let stream = zlib(b"tag-body-bytes");
+        let record = ObjectRecord::Tag {
+            uncompressed_len: 14,
+            zlib: stream.clone(),
+        };
 
         // then
         let mut expected = vec![0x05u8];
-        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&14u64.to_be_bytes());
+        expected.extend_from_slice(&stream);
         assert_eq!(record.encode(), expected);
         assert_eq!(record.kind(), ObjectKind::Tag);
     }
@@ -522,17 +614,68 @@ mod tests {
     fn should_round_trip_every_object_record_variant() {
         // given/when/then: each variant is its own encode -> decode -> compare cycle.
         for record in [
-            ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello")),
+            ObjectRecord::BlobInline {
+                uncompressed_len: 5,
+                zlib: zlib(b"hello"),
+            },
             ObjectRecord::BlobPointer { size: 999 },
-            ObjectRecord::Tree(Bytes::from_static(b"tree-body")),
-            ObjectRecord::Commit(Bytes::from_static(b"commit-body")),
-            ObjectRecord::Tag(Bytes::from_static(b"tag-body")),
+            ObjectRecord::Tree {
+                uncompressed_len: 9,
+                zlib: zlib(b"tree-body"),
+            },
+            ObjectRecord::Commit {
+                uncompressed_len: 11,
+                zlib: zlib(b"commit-body"),
+            },
+            ObjectRecord::Tag {
+                uncompressed_len: 8,
+                zlib: zlib(b"tag-body"),
+            },
         ] {
             assert_eq!(
                 ObjectRecord::decode(&record.encode()).expect("decodes"),
                 record
             );
         }
+    }
+
+    #[test]
+    fn should_round_trip_inline_record_through_encode_decode_inflate_to_original_content() {
+        // given: real content, deflated into an inline commit record
+        let content = b"tree cafebabe\nauthor A U Thor <a@example.com> 1 +0000\n\nhi\n";
+        let record = ObjectRecord::Commit {
+            uncompressed_len: content.len() as u64,
+            zlib: zlib(content),
+        };
+
+        // when: the record is serialized, read back, and its stream inflated
+        let decoded = ObjectRecord::decode(&record.encode()).expect("decodes");
+        let ObjectRecord::Commit {
+            uncompressed_len,
+            zlib,
+        } = &decoded
+        else {
+            panic!("decoded to the wrong variant: {decoded:?}");
+        };
+        let restored =
+            crate::storage::zlib::inflate(zlib, *uncompressed_len).expect("inflates cleanly");
+
+        // then: the original content comes back, kind/size read without inflating
+        assert_eq!(restored.as_ref(), content.as_slice());
+        assert_eq!(decoded.kind(), ObjectKind::Commit);
+        assert_eq!(decoded.size(), content.len() as u64);
+    }
+
+    #[test]
+    fn should_reject_truncated_inline_object_record() {
+        // given: a tag byte with fewer than the 8 length-prefix bytes
+        let bytes = [0x01, 0x00, 0x00, 0x00];
+
+        // when
+        let result = ObjectRecord::decode(&bytes);
+
+        // then
+        assert_eq!(result, Err(ValueError::Truncated));
     }
 
     #[test]

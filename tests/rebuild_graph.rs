@@ -34,7 +34,7 @@ fn push_three_commits(server: &TestServer) -> (PathBuf, String, Vec<String>) {
 fn walker_for(server: &TestServer, repo: RepoId) -> Walker {
     let store = server.store().clone();
     let blobs = BlobStore::new(store.object_store());
-    let objectdb = ObjectDb::new(store.clone(), blobs, 65536);
+    let objectdb = ObjectDb::new(store.clone(), blobs, 65536, 6);
     Walker::new(store, objectdb, repo)
 }
 

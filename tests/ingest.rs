@@ -22,7 +22,10 @@ async fn memory_objectdb(repo_name: &str) -> (ObjectDb, RepoMeta) {
     let store = Store::open("memory://").await.expect("open store");
     let meta = store.create_repo(repo_name).await.expect("create repo");
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    (ObjectDb::new(store, BlobStore::new(backing), 65536), meta)
+    (
+        ObjectDb::new(store, BlobStore::new(backing), 65536, 6),
+        meta,
+    )
 }
 
 /// A scratch area holding a fixture repository and a staging root.

@@ -1,10 +1,13 @@
-//! Façade over git object content: small records and blob headers/pointers
-//! live in SlateDB via [`Store`]; blob content over the inline threshold
-//! lives in object storage via [`BlobStore`].
+//! Façade over git object content: small records and blob pointers live in
+//! SlateDB via [`Store`]; blob content over the inline threshold lives in
+//! object storage via [`BlobStore`].
 //!
-//! See `docs/0001-init.md` §Overview (the 64KB inline-threshold split) and
-//! §Git Object Storage (pointer payload carries size; inline blobs keep
-//! their canonical header; tree/commit/tag records are body-only).
+//! Object content is stored deflated: every inline record and every offloaded
+//! blob holds the zlib stream of the object's bare content, computed once here
+//! at write time. Reads inflate through this façade; the pack path
+//! ([`ObjectDb::read_compressed`]) hands the stored streams straight out
+//! without inflating. See `docs/0001-init.md` §Overview (the 64KB
+//! inline-threshold split) and §Git Object Storage.
 
 use bytes::Bytes;
 use gix_hash::{ObjectId, oid};
@@ -14,6 +17,7 @@ use crate::storage::blobs::{BlobStore, BlobStoreError};
 use crate::storage::keys::RepoId;
 use crate::storage::store::{Durability, Store, StoreError};
 use crate::storage::values::ObjectRecord;
+use crate::storage::zlib;
 
 /// Errors returned by [`ObjectDb`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -24,12 +28,12 @@ pub enum ObjectDbError {
     /// An offloaded-blob object-storage operation failed.
     #[error(transparent)]
     Blob(#[from] BlobStoreError),
-    /// An inline blob record's canonical header could not be decoded.
-    /// Indicates storage corruption: [`ObjectDb::put`] never writes an
-    /// inline blob without a valid header.
-    #[error("corrupt inline blob header for {oid}")]
-    CorruptInlineBlob {
-        /// The object id whose inline record failed to decode.
+    /// A stored zlib stream did not inflate back to its recorded content
+    /// length. Indicates storage corruption: every stream [`ObjectDb::put`]
+    /// writes inflates cleanly.
+    #[error("corrupt zlib stream for {oid}")]
+    CorruptZlib {
+        /// The object id whose stored stream failed to inflate.
         oid: ObjectId,
     },
 }
@@ -41,28 +45,37 @@ pub struct ObjectDb {
     store: Store,
     blobs: BlobStore,
     inline_threshold: usize,
+    compression_level: u32,
 }
 
 impl ObjectDb {
     /// Build a façade over `store`'s object segment and `blobs` for
     /// offloaded blob content. A blob body of exactly `inline_threshold`
-    /// bytes stays inline; anything larger is offloaded to `blobs`.
-    pub fn new(store: Store, blobs: BlobStore, inline_threshold: usize) -> Self {
+    /// bytes (uncompressed) stays inline; anything larger is offloaded to
+    /// `blobs`. Content is deflated at `compression_level` (0–9) as it is
+    /// written.
+    pub fn new(
+        store: Store,
+        blobs: BlobStore,
+        inline_threshold: usize,
+        compression_level: u32,
+    ) -> Self {
         Self {
             store,
             blobs,
             inline_threshold,
+            compression_level,
         }
     }
 
     /// Store `body` (the object's content, with no git header) as `oid` of
     /// kind `kind`, writing the object record with the requested
-    /// [`Durability`]. A no-op if `oid` already has a record. An offloaded
-    /// blob's content finishes uploading to the blob store (awaited here)
-    /// before its pointer record is written, regardless of durability mode —
-    /// only the SlateDB record write itself is relaxed. Callers are
-    /// responsible for `oid` being the hash of the canonical encoding of
-    /// `kind`/`body`.
+    /// [`Durability`]. A no-op if `oid` already has a record. The content is
+    /// deflated once here; an offloaded blob's zlib stream finishes uploading
+    /// to the blob store (awaited here) before its pointer record is written,
+    /// regardless of durability mode — only the SlateDB record write itself is
+    /// relaxed. Callers are responsible for `oid` being the hash of the
+    /// canonical encoding of `kind`/`body`.
     pub async fn put(
         &self,
         repo: RepoId,
@@ -75,17 +88,30 @@ impl ObjectDb {
             return Ok(());
         }
 
+        let uncompressed_len = body.len() as u64;
         let record = match kind {
             Kind::Blob if body.len() > self.inline_threshold => {
-                self.blobs.put(oid, body.clone()).await?;
+                self.blobs.put(oid, self.compress(&body)).await?;
                 ObjectRecord::BlobPointer {
-                    size: body.len() as u64,
+                    size: uncompressed_len,
                 }
             }
-            Kind::Blob => ObjectRecord::BlobInline(with_loose_header(kind, &body)),
-            Kind::Tree => ObjectRecord::Tree(body),
-            Kind::Commit => ObjectRecord::Commit(body),
-            Kind::Tag => ObjectRecord::Tag(body),
+            Kind::Blob => ObjectRecord::BlobInline {
+                uncompressed_len,
+                zlib: self.compress(&body),
+            },
+            Kind::Tree => ObjectRecord::Tree {
+                uncompressed_len,
+                zlib: self.compress(&body),
+            },
+            Kind::Commit => ObjectRecord::Commit {
+                uncompressed_len,
+                zlib: self.compress(&body),
+            },
+            Kind::Tag => ObjectRecord::Tag {
+                uncompressed_len,
+                zlib: self.compress(&body),
+            },
         };
 
         self.store
@@ -94,9 +120,10 @@ impl ObjectDb {
         Ok(())
     }
 
-    /// Read an object's kind and body (content bytes, with any git header
-    /// stripped), fetching offloaded blob content from the blob store
-    /// transparently. `None` if the repo has no record for `oid`.
+    /// Read an object's kind and content bytes (no git header), inflating the
+    /// stored zlib stream and fetching offloaded blob content from the blob
+    /// store transparently. The single inflate choke point for every read-path
+    /// consumer of object content. `None` if the repo has no record for `oid`.
     pub async fn get(
         &self,
         repo: RepoId,
@@ -106,20 +133,71 @@ impl ObjectDb {
             return Ok(None);
         };
         let kind = record.kind();
-        let body = match record {
-            ObjectRecord::BlobInline(bytes) => strip_loose_header(oid, &bytes)?,
-            ObjectRecord::BlobPointer { .. } => self.blobs.get(oid).await?,
-            ObjectRecord::Tree(bytes) | ObjectRecord::Commit(bytes) | ObjectRecord::Tag(bytes) => {
-                bytes
+        let (uncompressed_len, stream) = match record {
+            ObjectRecord::BlobPointer { size } => (size, self.blobs.get(oid).await?),
+            ObjectRecord::BlobInline {
+                uncompressed_len,
+                zlib,
             }
+            | ObjectRecord::Tree {
+                uncompressed_len,
+                zlib,
+            }
+            | ObjectRecord::Commit {
+                uncompressed_len,
+                zlib,
+            }
+            | ObjectRecord::Tag {
+                uncompressed_len,
+                zlib,
+            } => (uncompressed_len, zlib),
         };
-        Ok(Some((kind, body)))
+        let content =
+            zlib::inflate(&stream, uncompressed_len).ok_or_else(|| ObjectDbError::CorruptZlib {
+                oid: oid.to_owned(),
+            })?;
+        Ok(Some((kind, content)))
     }
 
-    /// The object's kind and content size. Never touches the blob store:
-    /// pointer records carry their size in the payload, and inline/body
-    /// records derive it from their own bytes. `None` if the repo has no
-    /// record for `oid`.
+    /// Read an object's kind, content size, and the zlib stream of its content
+    /// — the bytes a pack entry copies verbatim behind its type/size header.
+    /// Offloaded blob content comes straight from the blob store (already a
+    /// zlib stream); nothing is inflated. `None` if the repo has no record for
+    /// `oid`.
+    pub async fn read_compressed(
+        &self,
+        repo: RepoId,
+        oid: &oid,
+    ) -> Result<Option<(Kind, u64, Bytes)>, ObjectDbError> {
+        let Some(record) = self.store.get_object(repo, oid).await? else {
+            return Ok(None);
+        };
+        let kind = record.kind();
+        let (uncompressed_len, stream) = match record {
+            ObjectRecord::BlobPointer { size } => (size, self.blobs.get(oid).await?),
+            ObjectRecord::BlobInline {
+                uncompressed_len,
+                zlib,
+            }
+            | ObjectRecord::Tree {
+                uncompressed_len,
+                zlib,
+            }
+            | ObjectRecord::Commit {
+                uncompressed_len,
+                zlib,
+            }
+            | ObjectRecord::Tag {
+                uncompressed_len,
+                zlib,
+            } => (uncompressed_len, zlib),
+        };
+        Ok(Some((kind, uncompressed_len, stream)))
+    }
+
+    /// The object's kind and content size. Never touches the blob store and
+    /// never inflates: every record carries its uncompressed content length.
+    /// `None` if the repo has no record for `oid`.
     pub async fn size(
         &self,
         repo: RepoId,
@@ -135,26 +213,11 @@ impl ObjectDb {
     pub async fn exists(&self, repo: RepoId, oid: &oid) -> Result<bool, ObjectDbError> {
         Ok(self.store.object_exists(repo, oid).await?)
     }
-}
 
-/// Prepend the canonical `<type> <size>\0` git header to `body`, producing
-/// an inline blob record's payload.
-fn with_loose_header(kind: Kind, body: &Bytes) -> Bytes {
-    let header = gix_object::encode::loose_header(kind, body.len() as u64);
-    let mut buf = Vec::with_capacity(header.len() + body.len());
-    buf.extend_from_slice(&header);
-    buf.extend_from_slice(body);
-    Bytes::from(buf)
-}
-
-/// Strip the canonical `<type> <size>\0` git header from an inline blob
-/// record's payload, returning the content bytes.
-fn strip_loose_header(oid: &oid, bytes: &Bytes) -> Result<Bytes, ObjectDbError> {
-    let (_, _, consumed) =
-        gix_object::decode::loose_header(bytes).map_err(|_| ObjectDbError::CorruptInlineBlob {
-            oid: oid.to_owned(),
-        })?;
-    Ok(bytes.slice(consumed..))
+    /// Deflate `content` into a zlib stream at the configured level.
+    fn compress(&self, content: &[u8]) -> Bytes {
+        Bytes::from(zlib::deflate(content, self.compression_level))
+    }
 }
 
 #[cfg(test)]
@@ -168,7 +231,7 @@ mod tests {
         let repo = store.create_repo("objects").await.expect("create").id;
         let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let blobs = BlobStore::new(backing);
-        (ObjectDb::new(store, blobs, inline_threshold), repo)
+        (ObjectDb::new(store, blobs, inline_threshold, 6), repo)
     }
 
     fn oid(hex_byte: u8) -> ObjectId {
@@ -198,7 +261,7 @@ mod tests {
             .await
             .expect("get record")
             .expect("present");
-        assert!(matches!(record, ObjectRecord::BlobInline(_)));
+        assert!(matches!(record, ObjectRecord::BlobInline { .. }));
         assert_eq!(
             db.get(repo, &id).await.expect("get").expect("present"),
             (Kind::Blob, body)
@@ -228,6 +291,29 @@ mod tests {
         assert_eq!(
             db.get(repo, &id).await.expect("get").expect("present"),
             (Kind::Blob, body)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_store_offloaded_blob_content_as_a_zlib_stream() {
+        // given: a compressible blob large enough to be offloaded
+        let (db, repo) = objectdb(8).await;
+        let id = oid(b'a');
+        let body = Bytes::from(b"abcabcabc".repeat(64));
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
+            .await
+            .expect("put");
+
+        // when: reading the bytes the blob store actually holds
+        let stored = db.blobs.get(&id).await.expect("blob store get");
+
+        // then: they are the zlib stream (smaller than, and not equal to, the
+        // content), and inflate back to the original blob
+        assert_ne!(stored.as_ref(), body.as_ref());
+        assert!(stored.len() < body.len());
+        assert_eq!(
+            crate::storage::zlib::inflate(&stored, body.len() as u64).expect("inflate"),
+            body
         );
     }
 

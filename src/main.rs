@@ -67,6 +67,16 @@ async fn main() -> anyhow::Result<()> {
         None => config,
     };
 
+    // Reject an out-of-range compression level from any source (CLI, env, or
+    // file) before opening storage, so a bad value fails loudly at startup
+    // rather than on the first object write.
+    if config.object_compression_level > 9 {
+        anyhow::bail!(
+            "object_compression_level must be between 0 and 9, got {}",
+            config.object_compression_level
+        );
+    }
+
     // `log_filter` is not a `Config` field: it only ever feeds the
     // subscriber's default directive, chosen here before anything about
     // `Config` is read. `EnvFilter::from_env_lossy` already gives `RUST_LOG`

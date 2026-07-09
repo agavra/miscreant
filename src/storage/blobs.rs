@@ -4,7 +4,11 @@
 //! Object Storage: blob content over the threshold lives under
 //! `blobs/<xx>/<rest>` (the first two hex characters of the object id, then
 //! the remainder — mirroring git's loose-object fanout) in the same root
-//! object store that hosts SlateDB under a sibling `slatedb/` prefix.
+//! object store that hosts SlateDB under a sibling `slatedb/` prefix. The
+//! bytes stored here are the zlib stream of the blob's content (deflated by
+//! [`crate::storage::objectdb::ObjectDb`] before offload); the blob's
+//! uncompressed size lives in its pointer record, so this store is never
+//! consulted just to answer a size query.
 
 use std::sync::Arc;
 
@@ -24,8 +28,8 @@ pub enum BlobStoreError {
     ObjectStore(#[from] object_store::Error),
 }
 
-/// Content-addressed store for blob bytes offloaded from SlateDB, keyed by
-/// object id under `blobs/<xx>/<rest>`.
+/// Content-addressed store for the zlib streams of blobs offloaded from
+/// SlateDB, keyed by object id under `blobs/<xx>/<rest>`.
 #[derive(Clone)]
 pub struct BlobStore {
     store: Arc<dyn ObjectStore>,

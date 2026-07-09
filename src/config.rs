@@ -83,6 +83,11 @@ pub struct Config {
     )]
     pub warm_on_start: bool,
 
+    /// zlib level (0–9) at which object content is deflated when written, so
+    /// serving a clone copies the stored stream out without recompressing.
+    #[arg(long, env = "MISCREANT_OBJECT_COMPRESSION_LEVEL", default_value_t = 6)]
+    pub object_compression_level: u32,
+
     /// TOML file supplying defaults for any of the flags/env vars above that
     /// were left unset (see `FileConfig`). A path that cannot be read or
     /// parsed is a startup error; there is no implicit discovery.
@@ -102,6 +107,7 @@ impl Default for Config {
             cache_memory_bytes: 536870912,
             cache_disk_bytes: 34359738368,
             warm_on_start: false,
+            object_compression_level: 6,
             config_path: None,
         }
     }
@@ -194,6 +200,7 @@ pub struct FileConfig {
     pub cache_memory_bytes: Option<u64>,
     pub cache_disk_bytes: Option<u64>,
     pub warm_on_start: Option<bool>,
+    pub object_compression_level: Option<u32>,
     pub log_filter: Option<String>,
 }
 
@@ -294,6 +301,11 @@ pub fn merge_file_config(
         && let Some(value) = file.warm_on_start
     {
         config.warm_on_start = value;
+    }
+    if left_at_default("object_compression_level")
+        && let Some(value) = file.object_compression_level
+    {
+        config.object_compression_level = value;
     }
     config
 }
@@ -428,6 +440,7 @@ mod tests {
             cache_memory_bytes: Some(1234),
             cache_disk_bytes: Some(5678),
             warm_on_start: Some(true),
+            object_compression_level: Some(1),
             log_filter: None,
         };
 
@@ -447,6 +460,7 @@ mod tests {
         assert_eq!(merged.cache_memory_bytes, 1234);
         assert_eq!(merged.cache_disk_bytes, 5678);
         assert!(merged.warm_on_start);
+        assert_eq!(merged.object_compression_level, 1);
     }
 
     #[test]
@@ -486,6 +500,7 @@ mod tests {
             ("MISCREANT_CACHE_MEMORY_BYTES", "4096"),
             ("MISCREANT_CACHE_DISK_BYTES", "8192"),
             ("MISCREANT_WARM_ON_START", "true"),
+            ("MISCREANT_OBJECT_COMPRESSION_LEVEL", "9"),
         ]);
         let (config, matches) = parse_config(&["test"]);
         let file = FileConfig {
@@ -498,6 +513,7 @@ mod tests {
             cache_memory_bytes: Some(1),
             cache_disk_bytes: Some(2),
             warm_on_start: Some(false),
+            object_compression_level: Some(1),
             log_filter: None,
         };
 
@@ -514,6 +530,7 @@ mod tests {
         assert_eq!(merged.cache_memory_bytes, 4096);
         assert_eq!(merged.cache_disk_bytes, 8192);
         assert!(merged.warm_on_start);
+        assert_eq!(merged.object_compression_level, 9);
     }
 
     #[test]
@@ -570,6 +587,10 @@ mod tests {
         assert_eq!(file.cache_memory_bytes, Some(defaults.cache_memory_bytes));
         assert_eq!(file.cache_disk_bytes, Some(defaults.cache_disk_bytes));
         assert_eq!(file.warm_on_start, Some(defaults.warm_on_start));
+        assert_eq!(
+            file.object_compression_level,
+            Some(defaults.object_compression_level)
+        );
         assert_eq!(file.log_filter.as_deref(), Some(DEFAULT_LOG_FILTER));
     }
 }

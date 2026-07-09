@@ -78,8 +78,11 @@ const OBJECT_FORMAT_SHA1: &str = "sha1";
 const DEFAULT_BRANCH: &str = "refs/heads/main";
 /// The symbolic ref name every repository is created with.
 const HEAD_REF: &str = "HEAD";
-/// KV layout version stamped on new repositories.
-const SCHEMA_VERSION: u32 = 1;
+/// KV layout version stamped on new repositories. Bumped when the object
+/// value encoding changed to a deflated, header-free payload; the value is
+/// written but not validated on open, so this is a record of the layout, not
+/// a gate.
+const SCHEMA_VERSION: u32 = 2;
 /// First repository id handed out; `0` is reserved for global metadata.
 const FIRST_REPO_ID: u64 = 1;
 
@@ -1298,7 +1301,10 @@ mod tests {
         assert!(!store.object_exists(repo, &blob).await.expect("exists"));
 
         // when
-        let record = ObjectRecord::BlobInline(Bytes::from_static(b"blob 5\0hello"));
+        let record = ObjectRecord::BlobInline {
+            uncompressed_len: 5,
+            zlib: Bytes::from_static(b"zlib-stream-bytes"),
+        };
         store
             .put_object(repo, &blob, &record, Durability::Durable)
             .await
@@ -1363,7 +1369,10 @@ mod tests {
             .put_object(
                 repo,
                 &blob_oid,
-                &ObjectRecord::BlobInline(Bytes::from_static(b"blob 1\0x")),
+                &ObjectRecord::BlobInline {
+                    uncompressed_len: 1,
+                    zlib: Bytes::from_static(b"x"),
+                },
                 Durability::Durable,
             )
             .await
@@ -1424,7 +1433,10 @@ mod tests {
                 .put_object(
                     repo,
                     &oid(byte),
-                    &ObjectRecord::BlobInline(Bytes::from_static(b"blob 1\0x")),
+                    &ObjectRecord::BlobInline {
+                        uncompressed_len: 1,
+                        zlib: Bytes::from_static(b"x"),
+                    },
                     Durability::Durable,
                 )
                 .await

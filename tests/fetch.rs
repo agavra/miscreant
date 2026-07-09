@@ -922,3 +922,34 @@ async fn should_fetch_new_commits_incrementally_via_protocol_v0() {
     );
     assert_fsck_clean(&clone_dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_serve_a_clonable_repo_at_compression_level_zero() {
+    // given: a server that deflates objects at level 0 (stored blocks, no
+    // compression), with both an inline file and an offloaded blob pushed
+    let mut config = test_config();
+    config.object_compression_level = 0;
+    let server = TestServer::spawn(config).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    commit_file(&local, "big.bin", &big, "add big blob");
+    let tip = commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a fresh clone reads back the level-0 streams verbatim
+    let clone_dir = clone_repo(&server, &url, "clone");
+
+    // then: the clone is object-complete, on the pushed tip, with both the
+    // inline and the offloaded blob intact — proving the level is plumbed
+    // end to end and inflate is level-agnostic
+    assert_fsck_clean(&clone_dir);
+    assert_eq!(rev_parse(&clone_dir, "HEAD"), tip);
+    assert_eq!(
+        std::fs::read(clone_dir.join("a.txt")).expect("read a.txt"),
+        b"alpha\n"
+    );
+    assert_eq!(
+        std::fs::read(clone_dir.join("big.bin")).expect("read big.bin"),
+        big
+    );
+}

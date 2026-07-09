@@ -34,6 +34,7 @@ tower-http = { version = "0.6.11", features = ["decompression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5"
+zlib-rs = "0.6.5"
 
 [dev-dependencies]
 flate2 = "1"

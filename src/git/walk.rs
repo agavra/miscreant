@@ -1124,7 +1124,7 @@ mod tests {
         let repo = store.create_repo("walk").await.expect("create repo").id;
         let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let blobs = BlobStore::new(backing);
-        let objects = ObjectDb::new(store.clone(), blobs, 65536);
+        let objects = ObjectDb::new(store.clone(), blobs, 65536, 6);
         Walker::new(store, objects, repo)
     }
 

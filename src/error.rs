@@ -87,9 +87,10 @@ impl Classify for ObjectDbError {
     fn class(&self) -> Class {
         match self {
             ObjectDbError::Store(e) => e.class(),
-            // A blob-store failure is object-storage trouble; a corrupt inline
-            // header is storage corruption. Neither is the client's doing.
-            ObjectDbError::Blob(_) | ObjectDbError::CorruptInlineBlob { .. } => Class::Server,
+            // A blob-store failure is object-storage trouble; a zlib stream
+            // that will not inflate is storage corruption. Neither is the
+            // client's doing.
+            ObjectDbError::Blob(_) | ObjectDbError::CorruptZlib { .. } => Class::Server,
         }
     }
 }
@@ -138,11 +139,9 @@ impl<E: Classify + std::error::Error> Classify for PackOutError<E> {
             // The object source (lookups feeding the pack) carries its own
             // classification.
             PackOutError::Input(e) => e.class(),
-            // Compression failures, output/hashing failures, and a pack cut
-            // short of its declared object count are all internal faults.
-            PackOutError::Entry { .. }
-            | PackOutError::Write(_)
-            | PackOutError::Truncated { .. } => Class::Server,
+            // Output/hashing failures and a pack cut short of its declared
+            // object count are both internal faults.
+            PackOutError::Write(_) | PackOutError::Truncated { .. } => Class::Server,
         }
     }
 }
@@ -215,8 +214,8 @@ mod tests {
 
     #[test]
     fn should_classify_promotion_corruption_as_server() {
-        // given: an object that verified its SHA yet cannot be parsed
-        let err = PromoteError::Objects(ObjectDbError::CorruptInlineBlob { oid: oid(b'd') });
+        // given: a stored object whose zlib stream will not inflate
+        let err = PromoteError::Objects(ObjectDbError::CorruptZlib { oid: oid(b'd') });
 
         // when/then
         assert_eq!(err.class(), Class::Server);
