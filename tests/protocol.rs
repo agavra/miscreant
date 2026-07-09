@@ -38,7 +38,10 @@ fn expected_upload_advert() -> Vec<u8> {
 /// an empty repository (the synthetic `capabilities^{}` line, and no symref
 /// since HEAD is unborn).
 fn expected_empty_upload_advert_v0() -> Vec<u8> {
-    let caps = format!("side-band-64k no-progress {}", agent_capability());
+    let caps = format!(
+        "multi_ack_detailed side-band-64k no-progress {}",
+        agent_capability()
+    );
     let zeros = "0".repeat(40);
     let cap_line = format!("{zeros} capabilities^{{}}\0{caps}\n");
     let mut expected = Vec::new();

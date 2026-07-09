@@ -111,16 +111,21 @@ pub struct UploadRef {
 /// order — the caller places `HEAD` first when it resolves, then the remaining
 /// refs sorted by name. The capability list rides on the first ref line after
 /// a NUL; when `HEAD` resolves it leads the list and carries the
-/// `symref=HEAD:<target>` capability naming its symref target. An empty
-/// repository (no resolvable refs) emits the synthetic `<null-oid>
-/// capabilities^{}` line so capabilities are still conveyed.
+/// `symref=HEAD:<target>` capability naming its symref target. The
+/// `multi_ack_detailed` capability signals that the fetch handler negotiates
+/// common history round by round. An empty repository (no resolvable refs)
+/// emits the synthetic `<null-oid> capabilities^{}` line so capabilities are
+/// still conveyed.
 pub fn upload_pack_v0(
     out: &mut Vec<u8>,
     refs: &[UploadRef],
     head_symref_target: Option<&str>,
     object_format: Kind,
 ) -> io::Result<()> {
-    let mut caps = format!("side-band-64k no-progress agent={}", agent());
+    let mut caps = format!(
+        "multi_ack_detailed side-band-64k no-progress agent={}",
+        agent()
+    );
     if let Some(target) = head_symref_target {
         caps.push_str(&format!(" symref=HEAD:{target}"));
     }
@@ -205,7 +210,7 @@ mod tests {
         // then: HEAD leads with the capabilities and the symref target after a
         // NUL; the branch line is bare
         let caps = format!(
-            "side-band-64k no-progress {} symref=HEAD:refs/heads/main",
+            "multi_ack_detailed side-band-64k no-progress {} symref=HEAD:refs/heads/main",
             agent_cap()
         );
         let mut expected = Vec::new();
@@ -237,7 +242,10 @@ mod tests {
 
         // then: the tag line carries the caps, immediately followed by its
         // peeled `^{}` line
-        let caps = format!("side-band-64k no-progress {}", agent_cap());
+        let caps = format!(
+            "multi_ack_detailed side-band-64k no-progress {}",
+            agent_cap()
+        );
         let mut expected = Vec::new();
         expected.extend(pkt(b"# service=git-upload-pack\n"));
         expected.extend_from_slice(FLUSH);
@@ -260,7 +268,10 @@ mod tests {
         upload_pack_v0(&mut out, &[], None, Kind::Sha1).expect("build");
 
         // then: the synthetic capabilities line carries the caps on the null oid
-        let caps = format!("side-band-64k no-progress {}", agent_cap());
+        let caps = format!(
+            "multi_ack_detailed side-band-64k no-progress {}",
+            agent_cap()
+        );
         let zeros = "0".repeat(40);
         let mut expected = Vec::new();
         expected.extend(pkt(b"# service=git-upload-pack\n"));

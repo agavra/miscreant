@@ -157,6 +157,14 @@ pub struct Selection {
     /// The haves the server recognized, for later acknowledgement. Haves the
     /// server does not know are silently dropped.
     pub common: Vec<ObjectId>,
+    /// Whether discovery resolved every want while commits still remained
+    /// unexplored on the frontier — the recognized haves bounded the traversal
+    /// short of the roots. `false` when the frontier drained (the walk reached
+    /// the roots), as it always does for a clone with no usable haves. Combined
+    /// with a non-empty `common`, this is the negotiation signal that the
+    /// server has enough shared history to build the pack now (git's
+    /// `ok_to_give_up`); it is derived from the walk and never steers it.
+    pub bounded_by_haves: bool,
 }
 
 /// Raw fetch wants split by how they are served, produced by
@@ -622,8 +630,19 @@ impl Walker {
             }
         }
 
+        // Discovery ended with `pending` empty (the only non-error exit). If
+        // the frontier still holds commits, some ancestry was left unexplored
+        // because a recognized have dominated it — the haves bounded the walk.
+        // If it drained, the walk reached the roots, as a clone with no usable
+        // haves always does.
+        let bounded_by_haves = !discovery.frontier.is_empty();
+
         to_send.extend(tags);
-        Ok(Selection { to_send, common })
+        Ok(Selection {
+            to_send,
+            common,
+            bounded_by_haves,
+        })
     }
 
     /// Phase II: expand the commits chosen by [`Walker::select_commits`]
@@ -1370,6 +1389,34 @@ mod tests {
         // then: the unknown have is dropped, the known one is common.
         assert_eq!(selection.common, vec![commits[0]]);
         assert_eq!(selection.to_send, vec![commits[1]]);
+    }
+
+    #[tokio::test]
+    async fn should_flag_bounded_by_haves_only_when_a_have_prunes_the_walk() {
+        // given: a linear chain
+        let w = walker().await;
+        let commits = chain(&w, 3).await;
+
+        // when: a clone with no haves — the walk drains to the root
+        let clone = w.select_commits(&[commits[2]], &[]).await.expect("select");
+        // then: the frontier emptied, so it is not bounded by haves
+        assert!(!clone.bounded_by_haves);
+
+        // when: an incremental fetch whose have dominates the tail
+        let incremental = w
+            .select_commits(&[commits[2]], &[commits[0]])
+            .await
+            .expect("select");
+        // then: the have pruned the ancestry, leaving the frontier non-empty
+        assert!(incremental.bounded_by_haves);
+
+        // when: the only offered have is unknown to the server
+        let unknown = w
+            .select_commits(&[commits[2]], &[bogus_oid()])
+            .await
+            .expect("select");
+        // then: nothing was common, so the walk ran to the root — not bounded
+        assert!(!unknown.bounded_by_haves);
     }
 
     #[tokio::test]

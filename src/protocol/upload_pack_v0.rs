@@ -25,7 +25,7 @@ use gix_packetline_blocking::{PacketLineRef, decode, encode};
 
 use crate::AppState;
 use crate::error::{self, Class};
-use crate::git::walk::{FilterSpec, Walker};
+use crate::git::walk::{FilterSpec, WalkError, Walker};
 use crate::protocol::upload_pack::LsRefsError;
 use crate::protocol::{advertise, http, upload_pack};
 use crate::storage::RepoMeta;
@@ -102,10 +102,12 @@ async fn build_advertisement(state: &AppState, meta: &RepoMeta) -> Result<Vec<u8
 /// Serve a classic `POST /<repo>/git-upload-pack` request. `repo` is the
 /// already validated repository name.
 ///
-/// A clone (no haves) is answered with `NAK` followed by the pack for the
-/// wants. Incremental fetches — any request carrying `have` lines — are
-/// declined with an in-band `ERR` directing the client to protocol v2, which
-/// serves negotiation.
+/// Smart-HTTP is stateless: every POST carries the client's full accumulated
+/// have list, so each round is computed from scratch. A round without `done`
+/// is a negotiation step — it acknowledges the common haves and reports
+/// whether the server can build the pack yet, sending no pack. A round with
+/// `done` runs the full walk and streams the pack, prefixed by the final
+/// acknowledgement.
 pub async fn upload_pack(state: &AppState, repo: &str, body: Bytes) -> Response {
     let request = match parse_request(&body) {
         Ok(request) => request,
@@ -127,44 +129,79 @@ pub async fn upload_pack(state: &AppState, repo: &str, body: Bytes) -> Response 
         return upload_pack::reject_fetch("fetch requires at least one want");
     }
 
-    // Incremental negotiation is not offered over the classic protocol; a
-    // client with objects to reuse must speak protocol v2.
-    if !request.haves.is_empty() {
-        return upload_pack::reject_fetch("incremental fetch requires protocol v2");
+    let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
+    if request.done {
+        stream_done_round(state, &meta, &walker, &request).await
+    } else {
+        negotiate(&walker, &request).await
     }
+}
 
-    let nak = match nak_line() {
-        Ok(nak) => nak,
+/// A negotiation round (no `done`): discover which of the client's haves the
+/// server shares and whether that shared history already bounds the wants,
+/// then answer with the acknowledgement block and no pack. Determining the
+/// commons and the ready signal is exactly Phase-I commit discovery over the
+/// round's wants and haves.
+async fn negotiate(walker: &Walker, request: &Request) -> Response {
+    let partition = match walker.partition_wants(&request.wants).await {
+        Ok(partition) => partition,
+        Err(err) => return classify_walk_error(err),
+    };
+    let selection = match walker
+        .select_commits(&partition.history, &request.haves)
+        .await
+    {
+        Ok(selection) => selection,
+        Err(err) => return classify_walk_error(err),
+    };
+
+    // `ready` mirrors git's ok_to_give_up: the server has enough shared history
+    // to build the pack when at least one have is common and discovery resolved
+    // the wants without walking to the roots.
+    let ready = !selection.common.is_empty() && selection.bounded_by_haves;
+    let body = match ack_negotiation_block(&selection.common, ready, request.multi_ack_detailed) {
+        Ok(body) => body,
         Err(_) => return http::internal_error(),
     };
-    // Without `done` there is no negotiation to advance and nothing common to
-    // report, so only the NAK is sent; the pack follows once the client is
-    // done.
-    if !request.done {
-        return http::git_response(StatusCode::OK, upload_pack::RESULT_CONTENT_TYPE, nak);
-    }
+    tracing::debug!(
+        haves = request.haves.len(),
+        common = selection.common.len(),
+        ready,
+        "fetch negotiation round"
+    );
+    http::git_response(StatusCode::OK, upload_pack::RESULT_CONTENT_TYPE, body)
+}
 
+/// A `done` round: run the full walk over the round's wants and haves and
+/// stream the pack, prefixed by the final acknowledgement — `ACK
+/// <last-common>` when any have is common, else `NAK`.
+async fn stream_done_round(
+    state: &AppState,
+    meta: &RepoMeta,
+    walker: &Walker,
+    request: &Request,
+) -> Response {
     let start = Instant::now();
-    let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
-    let (collected, _common) =
-        match upload_pack::plan_pack(&walker, &request.wants, &request.haves, &FilterSpec::None)
+    let (collected, common) =
+        match upload_pack::plan_pack(walker, &request.wants, &request.haves, &FilterSpec::None)
             .await
         {
             Ok(planned) => planned,
-            Err(err) => {
-                let class = error::classify(&err);
-                if matches!(class, Class::Client(_)) {
-                    metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
-                }
-                return upload_pack::error_response(class);
-            }
+            Err(err) => return classify_walk_error(err),
         };
     let Ok(count) = u32::try_from(collected.len()) else {
         return upload_pack::reject_fetch("too many objects for one pack");
     };
 
+    let prefix = match ack_done_line(&common) {
+        Ok(prefix) => prefix,
+        Err(_) => return http::internal_error(),
+    };
+
     tracing::debug!(
         wants = request.wants.len(),
+        haves = request.haves.len(),
+        common = common.len(),
         objects_packed = count,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "fetch planned"
@@ -174,13 +211,69 @@ pub async fn upload_pack(state: &AppState, repo: &str, body: Bytes) -> Response 
 
     upload_pack::stream_pack_response(
         state.objectdb.clone(),
-        &meta,
+        meta,
         collected,
         count,
-        nak,
+        prefix,
         request.side_band_64k,
         request.no_progress,
     )
+}
+
+/// Render a walk failure: a client-caused one (an unknown want) becomes an
+/// in-band `ERR` and counts as a rejected fetch; anything else is a 404 or a
+/// generic 500. Mirrors the protocol-v2 handler's classification so both
+/// protocols reject an invalid want identically.
+fn classify_walk_error(err: WalkError) -> Response {
+    let class = error::classify(&err);
+    if matches!(class, Class::Client(_)) {
+        metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
+    }
+    upload_pack::error_response(class)
+}
+
+/// Build a negotiation-round acknowledgement block: with `multi_ack_detailed`,
+/// an `ACK <oid> common` line for each common have (in request order), then an
+/// `ACK <last-common> ready` line when `ready`, and always a terminating
+/// `NAK`. Without that capability the detailed lines are suppressed and only
+/// the `NAK` is sent — the client keeps offering haves until it sends `done`.
+fn ack_negotiation_block(
+    common: &[ObjectId],
+    ready: bool,
+    multi_ack_detailed: bool,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if multi_ack_detailed {
+        for oid in common {
+            encode::data_to_write(
+                format!("ACK {} common\n", oid.to_hex()).as_bytes(),
+                &mut out,
+            )?;
+        }
+        if ready && let Some(last) = common.last() {
+            encode::data_to_write(
+                format!("ACK {} ready\n", last.to_hex()).as_bytes(),
+                &mut out,
+            )?;
+        }
+    }
+    encode::data_to_write(b"NAK\n", &mut out)?;
+    Ok(out)
+}
+
+/// Build the `done`-round acknowledgement line that prefixes the pack:
+/// `ACK <last-common>` (no status suffix) when any have is common, else `NAK`.
+fn ack_done_line(common: &[ObjectId]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    match common.last() {
+        Some(last) => {
+            encode::data_to_write(format!("ACK {}\n", last.to_hex()).as_bytes(), &mut out)?;
+        }
+        None => {
+            encode::data_to_write(b"NAK\n", &mut out)?;
+        }
+    }
+    Ok(out)
 }
 
 /// A 400 carrying an `ERR` pkt-line, for a body that is not framed as a valid
@@ -196,14 +289,6 @@ fn malformed() -> Response {
     }
 }
 
-/// The `NAK` pkt-line that opens a clone response (nothing common to
-/// acknowledge).
-fn nak_line() -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    encode::data_to_write(b"NAK\n", &mut out)?;
-    Ok(out)
-}
-
 /// A parsed classic fetch request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Request {
@@ -217,6 +302,9 @@ struct Request {
     side_band_64k: bool,
     /// The client asked to suppress side-band progress messages.
     no_progress: bool,
+    /// The client negotiated `multi_ack_detailed`, so negotiation rounds may
+    /// carry `ACK <oid> common`/`ready` lines; without it only `NAK` is sent.
+    multi_ack_detailed: bool,
 }
 
 /// The request body was not framed as a valid classic fetch request.
@@ -295,12 +383,13 @@ fn parse_request(body: &Bytes) -> Result<Request, ParseError> {
 /// Record the capabilities the endpoint acts on from the first want line's
 /// space-separated capability list. A capability may carry a `=value` suffix
 /// (e.g. `agent=git/2.x`); every capability the endpoint does not act on
-/// (including `agent` and, in this handler, any multi-ack variant) is ignored.
+/// (including `agent`) is ignored.
 fn parse_caps(caps: &str, request: &mut Request) {
     for token in caps.split(' ') {
         match token.split('=').next().unwrap_or(token) {
             "side-band-64k" => request.side_band_64k = true,
             "no-progress" => request.no_progress = true,
+            "multi_ack_detailed" => request.multi_ack_detailed = true,
             _ => {}
         }
     }
@@ -328,7 +417,7 @@ mod tests {
         // given: a clone request — a first want carrying capabilities, a second
         // bare want, a flush, then done
         let mut body = pkt(format!(
-            "want {} side-band-64k no-progress agent=git/2.43\n",
+            "want {} multi_ack_detailed side-band-64k no-progress agent=git/2.43\n",
             oid(b'a')
         )
         .as_bytes());
@@ -342,6 +431,7 @@ mod tests {
         // then: both wants are captured, the caps ride only on the first line,
         // and there are no haves
         assert_eq!(request.wants, vec![oid(b'a'), oid(b'b')]);
+        assert!(request.multi_ack_detailed);
         assert!(request.side_band_64k);
         assert!(request.no_progress);
         assert!(request.done);
@@ -431,5 +521,75 @@ mod tests {
         // given/when/then
         let body = pkt(b"want not-a-valid-oid\n");
         assert!(parse_request(&Bytes::from(body)).is_err());
+    }
+
+    #[test]
+    fn should_ack_each_common_in_order_then_ready_then_nak() {
+        // given: two common haves and a ready signal, multi_ack_detailed on
+        let common = vec![oid(b'c'), oid(b'd')];
+
+        // when
+        let block = ack_negotiation_block(&common, true, true).expect("block");
+
+        // then: an `ACK … common` per common in request order, then an
+        // `ACK <last> ready`, then the terminating NAK
+        let mut expected = pkt(format!("ACK {} common\n", oid(b'c').to_hex()).as_bytes());
+        expected.extend(pkt(
+            format!("ACK {} common\n", oid(b'd').to_hex()).as_bytes()
+        ));
+        expected.extend(pkt(format!("ACK {} ready\n", oid(b'd').to_hex()).as_bytes()));
+        expected.extend(pkt(b"NAK\n"));
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn should_omit_the_ready_ack_when_not_ready() {
+        // given: one common but no ready signal
+        let common = vec![oid(b'c')];
+
+        // when
+        let block = ack_negotiation_block(&common, false, true).expect("block");
+
+        // then: the common is acknowledged, but no ready line precedes the NAK
+        let mut expected = pkt(format!("ACK {} common\n", oid(b'c').to_hex()).as_bytes());
+        expected.extend(pkt(b"NAK\n"));
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn should_send_only_nak_when_multi_ack_detailed_not_negotiated() {
+        // given: commons and a ready signal, but the client did not negotiate
+        // multi_ack_detailed
+        let common = vec![oid(b'c')];
+
+        // when
+        let block = ack_negotiation_block(&common, true, false).expect("block");
+
+        // then: none of the detailed lines are sent, only the NAK
+        assert_eq!(block, pkt(b"NAK\n"));
+    }
+
+    #[test]
+    fn should_ack_the_last_common_on_a_done_round() {
+        // given: two commons
+        let common = vec![oid(b'c'), oid(b'e')];
+
+        // when
+        let line = ack_done_line(&common).expect("line");
+
+        // then: a single plain ACK of the last common (no status suffix)
+        assert_eq!(
+            line,
+            pkt(format!("ACK {}\n", oid(b'e').to_hex()).as_bytes())
+        );
+    }
+
+    #[test]
+    fn should_nak_on_a_done_round_without_common() {
+        // given/when: no common haves
+        let line = ack_done_line(&[]).expect("line");
+
+        // then
+        assert_eq!(line, pkt(b"NAK\n"));
     }
 }

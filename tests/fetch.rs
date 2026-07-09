@@ -221,6 +221,22 @@ fn extract_pack(pkts: &[Pkt]) -> Vec<u8> {
     pack
 }
 
+/// Pull the raw pack bytes out of a classic (v0) fetch response: the side-band
+/// channel-1 payload of every packet. The leading `ACK`/`NAK` pkt-lines and
+/// the channel-2/3 (progress/error) packets are skipped — a v0 response has no
+/// `packfile` section header to key off, unlike the v2 form.
+fn extract_sideband_pack(pkts: &[Pkt]) -> Vec<u8> {
+    let mut pack = Vec::new();
+    for p in pkts {
+        if let Pkt::Data(data) = p
+            && data.first() == Some(&1)
+        {
+            pack.extend_from_slice(&data[1..]);
+        }
+    }
+    pack
+}
+
 /// The object count a pack's v2 header declares (bytes 8..12, big-endian).
 fn pack_object_count(pack: &[u8]) -> u32 {
     assert!(pack.starts_with(b"PACK"), "not a pack: {:?}", pack.get(..4));
@@ -794,28 +810,115 @@ async fn should_stream_a_raw_pack_via_v0_when_side_band_is_not_negotiated() {
     assert_eq!(unpack_oids(&server, pack, "unpack-raw-v0").len(), 3);
 }
 
-// NOTE: the classic handler declines incremental fetches (any `have`) in favor
-// of protocol v2. This is superseded when v0 negotiation lands.
 #[tokio::test(flavor = "multi_thread")]
-async fn should_reject_a_classic_fetch_that_sends_haves() {
-    // given: a pushed commit
+async fn should_acknowledge_a_common_have_and_stream_an_incremental_pack_via_v0() {
+    // given: two pushed commits, so the client can claim the parent
     let server = TestServer::spawn(test_config()).await;
-    let (local, _url) = push_fixture(&server, "proj");
-    let tip = rev_parse(&local, "HEAD");
+    let (local, url) = push_fixture(&server, "proj");
+    let parent = rev_parse(&local, "HEAD");
+    let tip = commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
 
-    // when: a classic fetch that offers a have
-    let mut body = pkt(format!("want {tip}\n").as_bytes());
+    // when: a classic fetch wanting the tip, offering the parent, and done, with
+    // multi_ack_detailed + side-band-64k negotiated
+    let caps = "multi_ack_detailed side-band-64k";
+    let mut body = pkt(format!("want {tip} {caps}\n").as_bytes());
     body.extend_from_slice(FLUSH);
-    body.extend(pkt(format!("have {tip}\n").as_bytes()));
+    body.extend(pkt(format!("have {parent}\n").as_bytes()));
     body.extend(pkt(b"done\n"));
     let response = post_upload_pack_v0(&server.base_url(), "proj", body).await;
 
-    // then: an in-band ERR directing the client to protocol v2
+    // then: the done round opens with a plain ACK of the common, then the
+    // side-band pack — which holds only the incremental objects (the new
+    // commit, its root tree, and the new blob), not a full re-clone
     assert_eq!(response.status(), 200);
-    let text =
-        String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8 body");
-    assert!(
-        text.contains("ERR incremental fetch requires protocol v2"),
-        "body: {text}"
+    let bytes = response.bytes().await.expect("body");
+    let pkts = parse_pkts(&bytes);
+    assert_eq!(pkts[0], Pkt::Data(format!("ACK {parent}\n").into_bytes()));
+    let pack = extract_sideband_pack(&pkts);
+    assert_eq!(pack_object_count(&pack), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_acknowledge_common_and_signal_ready_in_a_v0_negotiation_round() {
+    // given: two pushed commits
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let parent = rev_parse(&local, "HEAD");
+    let tip = commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a negotiation round (no done) that wants the tip and offers the
+    // parent as a have
+    let caps = "multi_ack_detailed side-band-64k";
+    let mut body = pkt(format!("want {tip} {caps}\n").as_bytes());
+    body.extend_from_slice(FLUSH);
+    body.extend(pkt(format!("have {parent}\n").as_bytes()));
+    body.extend_from_slice(FLUSH);
+    let response = post_upload_pack_v0(&server.base_url(), "proj", body).await;
+
+    // then: the parent is acknowledged common, ready is signalled (it bounds
+    // the wanted tip), the round ends with NAK, and no pack is sent
+    assert_eq!(response.status(), 200);
+    let bytes = response.bytes().await.expect("body");
+    let pkts = parse_pkts(&bytes);
+    assert_eq!(
+        pkts,
+        vec![
+            Pkt::Data(format!("ACK {parent} common\n").into_bytes()),
+            Pkt::Data(format!("ACK {parent} ready\n").into_bytes()),
+            Pkt::Data(b"NAK\n".to_vec()),
+        ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_nak_a_v0_negotiation_round_with_no_common_have() {
+    // given: a pushed commit and an unrelated have the server has never seen
+    let server = TestServer::spawn(test_config()).await;
+    let (local, _url) = push_fixture(&server, "proj");
+    let tip = rev_parse(&local, "HEAD");
+    let stranger = "f".repeat(40);
+
+    // when: a negotiation round offering only the unknown have
+    let caps = "multi_ack_detailed side-band-64k";
+    let mut body = pkt(format!("want {tip} {caps}\n").as_bytes());
+    body.extend_from_slice(FLUSH);
+    body.extend(pkt(format!("have {stranger}\n").as_bytes()));
+    body.extend_from_slice(FLUSH);
+    let response = post_upload_pack_v0(&server.base_url(), "proj", body).await;
+
+    // then: the unknown have is silently dropped, so nothing is common and the
+    // round is a lone NAK
+    assert_eq!(response.status(), 200);
+    let bytes = response.bytes().await.expect("body");
+    assert_eq!(parse_pkts(&bytes), vec![Pkt::Data(b"NAK\n".to_vec())]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_fetch_new_commits_incrementally_via_protocol_v0() {
+    // given: a v0 clone taken before two further commits were pushed
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let clone_dir = clone_repo_v0(&server, &url, "clone-v0");
+    commit_file(&local, "b.txt", b"beta\n", "add b");
+    let tip = commit_file(&local, "c.txt", b"gamma\n", "add c");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: the existing clone fetches over the classic protocol (a real
+    // negotiation: git sends a no-done round, sees ready, then a done round),
+    // then fast-forwards
+    git_ok(&clone_dir, &["-c", "protocol.version=0", "fetch", "origin"]);
+    assert_eq!(rev_parse(&clone_dir, "origin/main"), tip);
+    let mut pull = IDENTITY.to_vec();
+    pull.extend_from_slice(&["-c", "protocol.version=0", "pull", "--ff-only"]);
+    git_ok(&clone_dir, &pull);
+
+    // then: the clone sits on the new tip with the new file present, intact
+    assert_eq!(rev_parse(&clone_dir, "HEAD"), tip);
+    assert_eq!(
+        std::fs::read(clone_dir.join("c.txt")).expect("read c.txt"),
+        b"gamma\n"
+    );
+    assert_fsck_clean(&clone_dir);
 }
