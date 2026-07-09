@@ -446,3 +446,44 @@ async fn should_return_404_for_ls_refs_on_unknown_repo() {
             .is_none()
     );
 }
+
+// The blocking `git push` subprocess drives HTTP against the in-process
+// server, so a multi-threaded runtime is required (see the note above the
+// clone tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn should_accept_a_gzip_compressed_command_body() {
+    // given: a repo with one pushed branch
+    let server = TestServer::spawn(test_config()).await;
+    let local = server.tempdir().join("local");
+    init_repo(&local);
+    commit_file(&local, "a.txt", b"alpha\n", "add a");
+    let url = format!("{}/proj.git", server.base_url());
+    let push = git(&local, &["push", &url, "main:refs/heads/main"]);
+    assert!(
+        push.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    // when: the ls-refs body arrives gzip-compressed, as git sends any RPC
+    // body above its compression threshold (e.g. a clone wanting many refs)
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &ls_refs_body(&[])).expect("compress");
+    let compressed = encoder.finish().expect("finish gzip");
+    let response = reqwest::Client::new()
+        .post(format!("{}/proj.git/git-upload-pack", server.base_url()))
+        .header("Git-Protocol", "version=2")
+        .header("Content-Encoding", "gzip")
+        .body(compressed)
+        .send()
+        .await
+        .expect("send request");
+
+    // then: the command is served exactly as if it were sent uncompressed
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    assert!(
+        String::from_utf8_lossy(&body).contains("refs/heads/main"),
+        "ls-refs response should list the pushed branch"
+    );
+}

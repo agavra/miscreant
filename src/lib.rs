@@ -15,6 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use tower_http::decompression::RequestDecompressionLayer;
 
 pub use crate::config::Config;
 use crate::storage::{BlobStore, CacheConfig, ObjectDb, Store, StoreError};
@@ -92,6 +93,17 @@ pub fn app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn(access_log))
+        // git gzips RPC request bodies above ~1KB (Content-Encoding: gzip),
+        // e.g. any fetch whose want list spans more than a few refs. The
+        // layer replaces the body with its decompressed stream before the
+        // route's body limit collects it, so the limit bounds the
+        // decompressed size; requests without a Content-Encoding pass
+        // through untouched.
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .pass_through_unaccepted(true),
+        )
         .with_state(state)
 }
 
