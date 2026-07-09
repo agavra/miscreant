@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tracing::Instrument;
 
 use crate::AppState;
-use crate::protocol::{advertise, receive_pack, upload_pack};
+use crate::protocol::{advertise, receive_pack, upload_pack, upload_pack_v0};
 
 /// Endpoint suffix for a ref-advertisement request.
 const INFO_REFS: &str = "info/refs";
@@ -88,43 +88,54 @@ pub async fn git_rpc(
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
         let span = tracing::debug_span!("upload_pack", repo = %repo, endpoint = "upload-pack");
-        upload_pack::upload_pack(&state, &repo, &headers, body)
-            .instrument(span)
-            .await
+        // `git` sends the protocol-v2 header on the POST too when speaking v2,
+        // so its presence selects the handler; its absence is the classic (v0)
+        // protocol.
+        if wants_v2(&headers) {
+            upload_pack::upload_pack(&state, &repo, &headers, body)
+                .instrument(span)
+                .await
+        } else {
+            upload_pack_v0::upload_pack(&state, &repo, body)
+                .instrument(span)
+                .await
+        }
     } else {
         plain(StatusCode::NOT_FOUND, "not found")
     }
 }
 
-/// Advertise upload-pack (fetch) capabilities. Requires protocol v2; an
-/// unknown repository is a 404 (upload-pack never auto-creates).
+/// Advertise upload-pack (fetch) capabilities. Protocol v2 gets the v2
+/// capability advertisement; the classic (v0) protocol gets a ref
+/// advertisement. Either way an unknown repository is a 404 (upload-pack never
+/// auto-creates).
 async fn upload_pack_advert(state: &AppState, repo: &str, headers: &HeaderMap) -> Response {
-    if !wants_v2(headers) {
-        return match advertise::error_line("git protocol version 2 required") {
-            Ok(body) => git_response(
-                StatusCode::BAD_REQUEST,
-                advertise::UPLOAD_ADVERTISEMENT_CONTENT_TYPE,
-                body,
-            ),
-            Err(_) => internal_error(),
-        };
-    }
-
-    match state.store.lookup_repo(repo).await {
-        Ok(Some(_)) => {}
+    let meta = match state.store.lookup_repo(repo).await {
+        Ok(Some(meta)) => meta,
         Ok(None) => return plain(StatusCode::NOT_FOUND, "repository not found"),
         Err(_) => return internal_error(),
+    };
+
+    if wants_v2(headers) {
+        let mut body = Vec::new();
+        if advertise::upload_pack(&mut body).is_err() {
+            return internal_error();
+        }
+        return git_response(
+            StatusCode::OK,
+            advertise::UPLOAD_ADVERTISEMENT_CONTENT_TYPE,
+            body,
+        );
     }
 
-    let mut body = Vec::new();
-    if advertise::upload_pack(&mut body).is_err() {
-        return internal_error();
+    match upload_pack_v0::advertise(state, &meta).await {
+        Ok(body) => git_response(
+            StatusCode::OK,
+            advertise::UPLOAD_ADVERTISEMENT_CONTENT_TYPE,
+            body,
+        ),
+        Err(()) => internal_error(),
     }
-    git_response(
-        StatusCode::OK,
-        advertise::UPLOAD_ADVERTISEMENT_CONTENT_TYPE,
-        body,
-    )
 }
 
 /// Advertise receive-pack (push) refs and capabilities. Auto-creates an

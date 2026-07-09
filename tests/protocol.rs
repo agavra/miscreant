@@ -34,6 +34,21 @@ fn expected_upload_advert() -> Vec<u8> {
     expected
 }
 
+/// The exact expected bytes of the classic (v0) upload-pack advertisement for
+/// an empty repository (the synthetic `capabilities^{}` line, and no symref
+/// since HEAD is unborn).
+fn expected_empty_upload_advert_v0() -> Vec<u8> {
+    let caps = format!("side-band-64k no-progress {}", agent_capability());
+    let zeros = "0".repeat(40);
+    let cap_line = format!("{zeros} capabilities^{{}}\0{caps}\n");
+    let mut expected = Vec::new();
+    expected.extend(pkt(b"# service=git-upload-pack\n"));
+    expected.extend_from_slice(FLUSH);
+    expected.extend(pkt(cap_line.as_bytes()));
+    expected.extend_from_slice(FLUSH);
+    expected
+}
+
 /// The exact expected bytes of the v0 receive-pack advertisement for an empty
 /// repository (the synthetic `capabilities^{}` line).
 fn expected_empty_receive_advert() -> Vec<u8> {
@@ -118,27 +133,32 @@ async fn should_advertise_receive_pack_capabilities_for_fresh_repo() {
 }
 
 #[tokio::test]
-async fn should_reject_upload_pack_advertisement_without_protocol_v2() {
-    // given
+async fn should_serve_v0_upload_pack_advertisement_without_protocol_v2() {
+    // given: an existing (empty) repository.
     let server = TestServer::spawn(test_config()).await;
+    server
+        .store()
+        .create_repo("acme/widgets")
+        .await
+        .expect("create");
 
-    // when: no Git-Protocol header.
+    // when: no Git-Protocol header selects the classic (v0) advertisement.
     let response = reqwest::get(format!(
-        "{}/any/repo/info/refs?service=git-upload-pack",
+        "{}/acme/widgets/info/refs?service=git-upload-pack",
         server.base_url()
     ))
     .await
     .expect("send request");
 
-    // then: 400 with an ERR pkt-line body.
-    assert_eq!(response.status(), 400);
+    // then: the v0 ref advertisement, an empty repo's synthetic capabilities line.
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-git-upload-pack-advertisement"
+    );
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
     let body = response.bytes().await.expect("body");
-    let message = b"git protocol version 2 required";
-    let mut expected = format!("{:04x}", 4 + 4 + message.len()).into_bytes();
-    expected.extend_from_slice(b"ERR ");
-    expected.extend_from_slice(message);
-    assert_eq!(body.as_ref(), expected.as_slice());
+    assert_eq!(body.as_ref(), expected_empty_upload_advert_v0().as_slice());
 }
 
 #[tokio::test]
@@ -241,12 +261,12 @@ async fn should_route_git_suffix_and_nested_names_to_the_same_repo() {
 }
 
 #[tokio::test]
-async fn should_reject_upload_pack_rpc_without_protocol_v2() {
+async fn should_reject_a_malformed_classic_upload_pack_rpc() {
     // given
     let server = TestServer::spawn(test_config()).await;
 
-    // when: the upload-pack RPC is served only for protocol v2, so a POST
-    // without the Git-Protocol header is refused before it is even parsed.
+    // when: a classic (non-v2) upload-pack POST whose body is not valid
+    // pkt-line framing (here, empty) is malformed.
     let response = reqwest::Client::new()
         .post(format!("{}/some/repo/git-upload-pack", server.base_url()))
         .body("")
@@ -254,9 +274,15 @@ async fn should_reject_upload_pack_rpc_without_protocol_v2() {
         .await
         .expect("send request");
 
-    // then
+    // then: a 400 carrying an ERR pkt-line.
     assert_eq!(response.status(), 400);
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+    let body = response.bytes().await.expect("body");
+    let message = b"malformed upload-pack request";
+    let mut expected = format!("{:04x}", 4 + 4 + message.len()).into_bytes();
+    expected.extend_from_slice(b"ERR ");
+    expected.extend_from_slice(message);
+    assert_eq!(body.as_ref(), expected.as_slice());
 }
 
 // The in-process server and the blocking `git` subprocess must run

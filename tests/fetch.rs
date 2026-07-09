@@ -51,6 +51,57 @@ async fn post_upload_pack(base_url: &str, repo: &str, body: Vec<u8>) -> reqwest:
         .expect("send request")
 }
 
+/// POST a classic (v0) fetch request to a repo's upload-pack endpoint: no
+/// `Git-Protocol` header, so the server serves the classic protocol.
+async fn post_upload_pack_v0(base_url: &str, repo: &str, body: Vec<u8>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base_url}/{repo}/git-upload-pack"))
+        .body(body)
+        .send()
+        .await
+        .expect("send request")
+}
+
+/// Build a classic (v0) fetch request body: one `want` pkt-line per oid (the
+/// first carrying `caps` after the oid when non-empty), a flush, then `done`.
+fn v0_fetch_body(wants: &[&str], caps: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (index, want) in wants.iter().enumerate() {
+        let line = if index == 0 && !caps.is_empty() {
+            format!("want {want} {caps}\n")
+        } else {
+            format!("want {want}\n")
+        };
+        body.extend(pkt(line.as_bytes()));
+    }
+    body.extend_from_slice(FLUSH);
+    body.extend(pkt(b"done\n"));
+    body
+}
+
+/// Clone `url` with the classic (v0) protocol forced on, into
+/// `<server tempdir>/<name>`, asserting success. The later `-c` overrides the
+/// hermetic harness's `protocol.version=2`.
+fn clone_repo_v0(server: &TestServer, url: &str, name: &str) -> PathBuf {
+    let clone_dir = server.tempdir().join(name);
+    let clone = git(
+        server.tempdir(),
+        &[
+            "-c",
+            "protocol.version=0",
+            "clone",
+            url,
+            clone_dir.to_str().expect("utf-8 clone path"),
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "v0 clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    clone_dir
+}
+
 /// One decoded pkt-line of a response body.
 #[derive(Debug, PartialEq, Eq)]
 enum Pkt {
@@ -652,5 +703,119 @@ async fn should_materialize_an_earlier_commit_on_checkout() {
     assert!(
         !clone_dir.join("b.txt").exists(),
         "b.txt absent at the root commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_clone_pushed_history_via_protocol_v0() {
+    // given: two pushed commits
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let tip = commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a fresh clone forced onto the classic (v0) protocol
+    let clone_dir = clone_repo_v0(&server, &url, "clone-v0");
+
+    // then: the clone is object-complete, sits on the pushed tip, and both
+    // files check out with the right contents
+    assert_fsck_clean(&clone_dir);
+    assert_eq!(rev_parse(&clone_dir, "HEAD"), tip);
+    assert_eq!(
+        std::fs::read(clone_dir.join("a.txt")).expect("read a.txt"),
+        b"alpha\n"
+    );
+    assert_eq!(
+        std::fs::read(clone_dir.join("b.txt")).expect("read b.txt"),
+        b"beta\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_still_clone_pushed_history_via_protocol_v2() {
+    // given: two pushed commits
+    let server = TestServer::spawn(test_config()).await;
+    let (local, url) = push_fixture(&server, "proj");
+    let tip = commit_file(&local, "b.txt", b"beta\n", "add b");
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a fresh clone forced onto protocol v2 (still the default path)
+    let clone_dir = server.tempdir().join("clone-v2");
+    let clone = git(
+        server.tempdir(),
+        &[
+            "-c",
+            "protocol.version=2",
+            "clone",
+            &url,
+            clone_dir.to_str().expect("utf-8 clone path"),
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "v2 clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+
+    // then: the v2 clone is unaffected by the classic path
+    assert_fsck_clean(&clone_dir);
+    assert_eq!(rev_parse(&clone_dir, "HEAD"), tip);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_stream_a_raw_pack_via_v0_when_side_band_is_not_negotiated() {
+    // given: a pushed commit
+    let server = TestServer::spawn(test_config()).await;
+    let (local, _url) = push_fixture(&server, "proj");
+    let tip = rev_parse(&local, "HEAD");
+
+    // when: a classic fetch that wants the tip, negotiates no capabilities, and
+    // is done
+    let body = v0_fetch_body(&[&tip], "");
+    let response = post_upload_pack_v0(&server.base_url(), "proj", body).await;
+
+    // then: a NAK pkt-line, then the raw pack bytes directly (no side-band
+    // framing) — a real, unpackable pack of the commit's closure
+    assert_eq!(response.status(), 200);
+    let bytes = response.bytes().await.expect("body");
+    assert!(
+        bytes.starts_with(b"0008NAK\n"),
+        "expected NAK pkt: {:?}",
+        &bytes[..8.min(bytes.len())]
+    );
+    let pack = &bytes[8..];
+    assert!(
+        pack.starts_with(b"PACK"),
+        "raw pack follows NAK: {:?}",
+        &pack[..4.min(pack.len())]
+    );
+    assert_eq!(pack_object_count(pack), 3);
+    // commit + root tree + the one blob
+    assert_eq!(unpack_oids(&server, pack, "unpack-raw-v0").len(), 3);
+}
+
+// NOTE: the classic handler declines incremental fetches (any `have`) in favor
+// of protocol v2. This is superseded when v0 negotiation lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn should_reject_a_classic_fetch_that_sends_haves() {
+    // given: a pushed commit
+    let server = TestServer::spawn(test_config()).await;
+    let (local, _url) = push_fixture(&server, "proj");
+    let tip = rev_parse(&local, "HEAD");
+
+    // when: a classic fetch that offers a have
+    let mut body = pkt(format!("want {tip}\n").as_bytes());
+    body.extend_from_slice(FLUSH);
+    body.extend(pkt(format!("have {tip}\n").as_bytes()));
+    body.extend(pkt(b"done\n"));
+    let response = post_upload_pack_v0(&server.base_url(), "proj", body).await;
+
+    // then: an in-band ERR directing the client to protocol v2
+    assert_eq!(response.status(), 200);
+    let text =
+        String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8 body");
+    assert!(
+        text.contains("ERR incremental fetch requires protocol v2"),
+        "body: {text}"
     );
 }

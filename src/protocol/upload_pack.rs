@@ -44,19 +44,20 @@ use crate::storage::keys::RepoId;
 use crate::storage::values::RefTarget;
 use crate::storage::{ObjectDb, ObjectDbError, RepoMeta, Store, StoreError};
 
-/// Content type of an upload-pack RPC result.
-const RESULT_CONTENT_TYPE: &str = "application/x-git-upload-pack-result";
+/// Content type of an upload-pack RPC result. Shared with the classic (v0)
+/// fetch handler, which produces the same result media type.
+pub(super) const RESULT_CONTENT_TYPE: &str = "application/x-git-upload-pack-result";
 
 /// Upper bound on symref indirection when resolving a ref to an object id. A
 /// chain longer than this leaves the ref unresolved and it is omitted from the
 /// advertisement. A chain that dangles within the cap (its last hop names a
 /// nonexistent ref) is also unresolved, but may still be advertised as an
 /// unborn ref when the client requested `unborn`.
-const MAX_SYMREF_DEPTH: usize = 5;
+pub(super) const MAX_SYMREF_DEPTH: usize = 5;
 
 /// Upper bound on tag-object indirection when peeling a ref to its final
 /// non-tag object. A chain longer than this leaves the ref unpeeled.
-const MAX_PEEL_DEPTH: usize = 5;
+pub(super) const MAX_PEEL_DEPTH: usize = 5;
 
 /// Number of object-database lookups kept in flight while feeding the pack
 /// writer. Lookups run concurrently against storage, but their results are
@@ -138,7 +139,7 @@ fn version_error() -> Response {
 /// as a fatal error, carried in an otherwise-successful result response. Every
 /// client-caused upload-pack rejection funnels through here, so one debug event
 /// records the reason for the whole endpoint.
-fn err_line(message: &str) -> Response {
+pub(super) fn err_line(message: &str) -> Response {
     tracing::debug!(reason = %message, "request rejected");
     match advertise::error_line(message) {
         Ok(body) => http::git_response(StatusCode::OK, RESULT_CONTENT_TYPE, body),
@@ -151,7 +152,7 @@ fn err_line(message: &str) -> Response {
 /// directly in [`fetch`] go through here; a rejection classified from a
 /// domain error (via [`error::classify`]) is counted at its own call site so
 /// a server-side fault (never "rejected") is not double-counted.
-fn reject_fetch(message: &str) -> Response {
+pub(super) fn reject_fetch(message: &str) -> Response {
     metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
     err_line(message)
 }
@@ -160,7 +161,7 @@ fn reject_fetch(message: &str) -> Response {
 /// called once by the caller so a server fault is logged exactly once): a
 /// client-caused failure becomes an in-band `ERR` pkt-line, an absent
 /// repository a 404, and an internal fault a generic 500.
-fn error_response(class: Class) -> Response {
+pub(super) fn error_response(class: Class) -> Response {
     match class {
         Class::Client(reason) => err_line(&reason),
         Class::NotFound => http::plain(StatusCode::NOT_FOUND, "repository not found"),
@@ -185,16 +186,17 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     }
 
     let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
-    let (collected, common) = match plan_pack(&walker, &parsed).await {
-        Ok(planned) => planned,
-        Err(err) => {
-            let class = error::classify(&err);
-            if matches!(class, Class::Client(_)) {
-                metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
+    let (collected, common) =
+        match plan_pack(&walker, &parsed.wants, &parsed.haves, &parsed.filter).await {
+            Ok(planned) => planned,
+            Err(err) => {
+                let class = error::classify(&err);
+                if matches!(class, Class::Client(_)) {
+                    metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
+                }
+                return error_response(class);
             }
-            return error_response(class);
-        }
-    };
+        };
     let Ok(count) = u32::try_from(collected.len()) else {
         return reject_fetch("too many objects for one pack");
     };
@@ -217,24 +219,52 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
         Err(_) => return http::internal_error(),
     };
 
-    // Look up object contents concurrently (up to OBJECT_LOOKAHEAD in
-    // flight), hand them in collected order to the blocking pack writer,
-    // and stream its side-band packets out as the response body. Both the
-    // spawned lookup task and the blocking writer carry the request span so
-    // any events they emit inherit the repo/endpoint context.
+    // Protocol v2 always multiplexes the pack over side-band-64k.
+    stream_pack_response(
+        state.objectdb.clone(),
+        meta,
+        collected,
+        count,
+        prefix,
+        true,
+        parsed.no_progress,
+    )
+}
+
+/// Spawn the pack-streaming pipeline shared by the protocol-v2 and classic
+/// (v0) fetch handlers, and return the response whose body is `prefix` (the
+/// pkt-lines that precede the pack) followed by the pack itself. Object
+/// contents are looked up concurrently (up to [`OBJECT_LOOKAHEAD`] in flight)
+/// and handed in collected order to a blocking pack writer, which streams the
+/// pack out as the response body — side-band-64k multiplexed when `sideband`
+/// is set, raw pack bytes otherwise. Both the lookup task and the writer carry
+/// the request span so any events they emit inherit the repo/endpoint context.
+pub(super) fn stream_pack_response(
+    objectdb: ObjectDb,
+    meta: &RepoMeta,
+    collected: Vec<ObjectId>,
+    count: u32,
+    prefix: Vec<u8>,
+    sideband: bool,
+    no_progress: bool,
+) -> Response {
+    let repo = meta.id;
+    let object_hash = meta.object_format;
     let span = Span::current();
     let (object_tx, object_rx) = mpsc::channel(OBJECT_LOOKAHEAD);
-    tokio::spawn(
-        feed_objects(state.objectdb.clone(), meta.id, collected, object_tx)
-            .instrument(span.clone()),
-    );
+    tokio::spawn(feed_objects(objectdb, repo, collected, object_tx).instrument(span.clone()));
 
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_PACKETS);
-    let object_hash = meta.object_format;
-    let no_progress = parsed.no_progress;
     tokio::task::spawn_blocking(move || {
         let _guard = span.enter();
-        stream_pack(object_rx, body_tx, count, object_hash, no_progress);
+        stream_pack(
+            object_rx,
+            body_tx,
+            count,
+            object_hash,
+            sideband,
+            no_progress,
+        );
     });
 
     let body = Body::from_stream(
@@ -259,20 +289,20 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
 /// them from traversal, because an explicitly requested object is never
 /// filtered out. Directly wanted objects the walk already collected are added
 /// once.
-async fn plan_pack(
+pub(super) async fn plan_pack(
     walker: &Walker,
-    parsed: &FetchArgs,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    filter: &FilterSpec,
 ) -> Result<(Vec<ObjectId>, Vec<ObjectId>), WalkError> {
-    let partition = walker.partition_wants(&parsed.wants).await?;
+    let partition = walker.partition_wants(wants).await?;
     if partition.history.is_empty() {
         return Ok((partition.direct, Vec::new()));
     }
 
-    let selection = walker
-        .select_commits(&partition.history, &parsed.haves)
-        .await?;
+    let selection = walker.select_commits(&partition.history, haves).await?;
     let mut collected = walker
-        .collect(&selection.to_send, &selection.common, &parsed.filter)
+        .collect(&selection.to_send, &selection.common, filter)
         .await?;
     let mut seen: HashSet<ObjectId> = collected.iter().copied().collect();
     for oid in partition.direct {
@@ -336,18 +366,43 @@ async fn feed_objects(
 }
 
 /// The blocking half of the fetch response: pull looked-up objects from
-/// `objects`, compress them into pack entries, and send the pack multiplexed
-/// as side-band channel-1 packets on `body`, with progress on channel 2
-/// (unless suppressed) and a flush pkt closing a successful response. A
-/// failure after streaming has begun is reported on channel 3 — the only
-/// remaining path to the client — except when the client itself hung up.
+/// `objects`, compress them into pack entries, and send the pack out on
+/// `body`. With `sideband` set the pack is multiplexed as side-band channel-1
+/// packets, with progress on channel 2 (unless suppressed) and a flush pkt
+/// closing a successful response, and a failure after streaming has begun is
+/// reported on channel 3 — the only remaining path to the client — except
+/// when the client itself hung up. Without side-band the pack bytes are sent
+/// raw with no framing, no progress, and no trailing flush; a mid-stream
+/// failure then has no in-band channel and leaves the client a truncated pack
+/// to reject.
 fn stream_pack(
     mut objects: mpsc::Receiver<Result<(ObjectId, Kind, Bytes), FetchObjectError>>,
     body: mpsc::Sender<Bytes>,
     count: u32,
     object_hash: gix_hash::Kind,
+    sideband: bool,
     no_progress: bool,
 ) {
+    let input = std::iter::from_fn(|| objects.blocking_recv());
+    if !sideband {
+        let mut writer = RawWriter {
+            tx: body.clone(),
+            buf: Vec::new(),
+            bytes_written: 0,
+        };
+        let outcome = write_pack(input, count, object_hash, &mut writer);
+        metrics::histogram!("fetch_pack_bytes").record(writer.bytes_written as f64);
+        if let Err(err) = outcome
+            && !is_broken_pipe(&err)
+        {
+            // There is no side-band error channel here; the failure is logged
+            // and the client is left with a short pack that fails its own
+            // index-pack.
+            let _ = error::classify(&err);
+        }
+        return;
+    }
+
     if !no_progress {
         let line = format!("packing {count} objects\n");
         let _ = send_band(&body, Channel::Progress, line.as_bytes());
@@ -358,7 +413,6 @@ fn stream_pack(
         buf: Vec::new(),
         bytes_written: 0,
     };
-    let input = std::iter::from_fn(|| objects.blocking_recv());
     let outcome = write_pack(input, count, object_hash, &mut writer);
     // Counted here because this is where the true byte count exists: bytes
     // actually handed to the response channel, whether the pack completed or
@@ -377,9 +431,7 @@ fn stream_pack(
         }
         Err(err) => {
             // A hung-up client is not a fault and has no one left to tell.
-            if let PackOutError::Write(gix_hash::io::Error::Io(io_err)) = &err
-                && io_err.kind() == io::ErrorKind::BrokenPipe
-            {
+            if is_broken_pipe(&err) {
                 return;
             }
             let reason = match error::classify(&err) {
@@ -389,6 +441,16 @@ fn stream_pack(
             let _ = send_band(&body, Channel::Error, reason.as_bytes());
         }
     }
+}
+
+/// Whether a pack-write failure is the client hanging up mid-stream (a broken
+/// pipe on the response channel), which is not a server fault and has no one
+/// left to report to.
+fn is_broken_pipe(err: &PackOutError<FetchObjectError>) -> bool {
+    matches!(
+        err,
+        PackOutError::Write(gix_hash::io::Error::Io(io_err)) if io_err.kind() == io::ErrorKind::BrokenPipe
+    )
 }
 
 /// Encode one side-band packet on `channel` and send it to the response
@@ -428,6 +490,45 @@ impl io::Write for BandWriter {
         if !self.buf.is_empty() {
             let data = std::mem::take(&mut self.buf);
             send_band(&self.tx, Channel::Data, &data)?;
+        }
+        Ok(())
+    }
+}
+
+/// An `io::Write` that forwards written bytes verbatim to the HTTP response
+/// channel, batching them into [`MAX_BAND_DATA`]-sized chunks so the number of
+/// channel messages stays bounded. Unlike [`BandWriter`] it adds no side-band
+/// framing: it is the response body for a classic fetch the client did not
+/// negotiate side-band-64k on, where the raw pack follows the ACK/NAK pkt
+/// directly.
+struct RawWriter {
+    tx: mpsc::Sender<Bytes>,
+    buf: Vec<u8>,
+    /// Total bytes handed to [`io::Write::write`] so far — the pack's true
+    /// output size.
+    bytes_written: u64,
+}
+
+impl io::Write for RawWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.bytes_written += data.len() as u64;
+        self.buf.extend_from_slice(data);
+        while self.buf.len() >= MAX_BAND_DATA {
+            let rest = self.buf.split_off(MAX_BAND_DATA);
+            let full = std::mem::replace(&mut self.buf, rest);
+            self.tx
+                .blocking_send(Bytes::from(full))
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let data = std::mem::take(&mut self.buf);
+            self.tx
+                .blocking_send(Bytes::from(data))
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         }
         Ok(())
     }
@@ -696,7 +797,7 @@ async fn gather_refs(
 }
 
 /// The outcome of following a ref target to a direct object id.
-enum Resolution {
+pub(super) enum Resolution {
     /// The chain terminated at a direct object id.
     Resolved(ObjectId),
     /// The chain dangled within the depth cap: some hop names a ref that does
@@ -709,7 +810,7 @@ enum Resolution {
 
 /// Follow a ref target to a direct object id, chasing symref chains up to
 /// [`MAX_SYMREF_DEPTH`].
-async fn resolve_ref(
+pub(super) async fn resolve_ref(
     store: &Store,
     repo: RepoId,
     target: &RefTarget,
@@ -731,7 +832,7 @@ async fn resolve_ref(
 /// [`MAX_PEEL_DEPTH`]. Returns `Some(oid)` only when the ref points at a tag
 /// object; a ref pointing directly at a commit, tree, or blob is not peeled,
 /// and neither is a chain exceeding the cap.
-async fn peel_ref(
+pub(super) async fn peel_ref(
     objectdb: &ObjectDb,
     repo: RepoId,
     oid: ObjectId,
@@ -863,9 +964,12 @@ impl LsRefsArgs {
     }
 }
 
-/// A failure while building the `ls-refs` response.
+/// A failure while resolving refs for advertisement: building the protocol-v2
+/// `ls-refs` response or the classic (v0) ref advertisement. Both follow
+/// symref chains and peel tags through the same store and object-database
+/// reads, so they share this error's variants and classification.
 #[derive(Debug, thiserror::Error)]
-enum LsRefsError {
+pub(super) enum LsRefsError {
     /// A ref-store read failed.
     #[error(transparent)]
     Store(#[from] StoreError),

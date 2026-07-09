@@ -302,12 +302,14 @@ async fn should_clone_an_empty_repo_onto_the_servers_default_branch() {
 }
 
 #[tokio::test]
-async fn should_reject_upload_pack_without_protocol_v2() {
+async fn should_reject_a_v2_command_body_sent_without_protocol_v2() {
     // given
     let server = TestServer::spawn(test_config()).await;
     server.store().create_repo("proj").await.expect("create");
 
-    // when: a well-formed ls-refs request but no Git-Protocol header
+    // when: a well-formed v2 ls-refs command body but no Git-Protocol header,
+    // so it reaches the classic (v0) handler, which does not speak v2 command
+    // framing
     let response = reqwest::Client::new()
         .post(format!("{}/proj/git-upload-pack", server.base_url()))
         .body(ls_refs_body(&[]))
@@ -315,10 +317,10 @@ async fn should_reject_upload_pack_without_protocol_v2() {
         .await
         .expect("send request");
 
-    // then: 400 with the version ERR pkt-line
+    // then: 400 with a malformed-request ERR pkt-line
     assert_eq!(response.status(), 400);
     let body = response.bytes().await.expect("body");
-    let message = b"git protocol version 2 required";
+    let message = b"malformed upload-pack request";
     let mut expected = format!("{:04x}", 4 + 4 + message.len()).into_bytes();
     expected.extend_from_slice(b"ERR ");
     expected.extend_from_slice(message);

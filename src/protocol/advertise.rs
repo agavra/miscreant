@@ -6,7 +6,7 @@
 
 use std::io;
 
-use gix_hash::Kind;
+use gix_hash::{Kind, ObjectId};
 use gix_packetline_blocking::encode;
 
 use crate::storage::values::RefTarget;
@@ -90,9 +90,185 @@ pub fn receive_pack(
     Ok(())
 }
 
+/// A ref resolved for the classic (v0) upload-pack advertisement: its name,
+/// the object id it resolves to, and the peeled commit when it names an
+/// annotated tag object.
+pub struct UploadRef {
+    /// Full ref name (`HEAD`, `refs/heads/main`, `refs/tags/v1`, …).
+    pub name: String,
+    /// The object id the ref resolves to.
+    pub oid: ObjectId,
+    /// The final non-tag object when `name` points at an annotated tag,
+    /// advertised on a trailing `<peeled> <name>^{}` line.
+    pub peeled: Option<ObjectId>,
+}
+
+/// Build the classic (v0) upload-pack ref advertisement.
+///
+/// Layout: `# service=git-upload-pack\n` then a flush, then one `<oid> <name>`
+/// pkt-line per ref (each annotated tag followed immediately by its
+/// `<peeled-oid> <name>^{}` line), terminated by a flush. `refs` is emitted in
+/// order — the caller places `HEAD` first when it resolves, then the remaining
+/// refs sorted by name. The capability list rides on the first ref line after
+/// a NUL; when `HEAD` resolves it leads the list and carries the
+/// `symref=HEAD:<target>` capability naming its symref target. An empty
+/// repository (no resolvable refs) emits the synthetic `<null-oid>
+/// capabilities^{}` line so capabilities are still conveyed.
+pub fn upload_pack_v0(
+    out: &mut Vec<u8>,
+    refs: &[UploadRef],
+    head_symref_target: Option<&str>,
+    object_format: Kind,
+) -> io::Result<()> {
+    let mut caps = format!("side-band-64k no-progress agent={}", agent());
+    if let Some(target) = head_symref_target {
+        caps.push_str(&format!(" symref=HEAD:{target}"));
+    }
+
+    encode::data_to_write(b"# service=git-upload-pack\n", &mut *out)?;
+    encode::flush_to_write(&mut *out)?;
+
+    if refs.is_empty() {
+        // No resolvable refs: convey capabilities on the null-oid line.
+        let null = object_format.null();
+        let line = format!("{} capabilities^{{}}\0{caps}\n", null.to_hex());
+        encode::data_to_write(line.as_bytes(), &mut *out)?;
+    } else {
+        for (index, advertised) in refs.iter().enumerate() {
+            let line = if index == 0 {
+                format!("{} {}\0{caps}\n", advertised.oid.to_hex(), advertised.name)
+            } else {
+                format!("{} {}\n", advertised.oid.to_hex(), advertised.name)
+            };
+            encode::data_to_write(line.as_bytes(), &mut *out)?;
+            if let Some(peeled) = advertised.peeled {
+                let peeled_line = format!("{} {}^{{}}\n", peeled.to_hex(), advertised.name);
+                encode::data_to_write(peeled_line.as_bytes(), &mut *out)?;
+            }
+        }
+    }
+
+    encode::flush_to_write(&mut *out)?;
+    Ok(())
+}
+
 /// Build a single `ERR <message>` pkt-line, used for protocol-level rejections.
 pub fn error_line(message: &str) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     encode::error_to_write(message.as_bytes(), &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a data pkt-line: a 4-hex length prefix (covering itself) then the
+    /// payload verbatim.
+    fn pkt(data: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    const FLUSH: &[u8] = b"0000";
+
+    /// A distinct SHA-1 object id built from a single hex nibble.
+    fn oid(nibble: u8) -> ObjectId {
+        ObjectId::from_hex(&[nibble; 40]).expect("valid sha1 hex")
+    }
+
+    fn agent_cap() -> String {
+        format!("agent={}", agent())
+    }
+
+    #[test]
+    fn should_put_capabilities_and_symref_on_the_first_v0_upload_line() {
+        // given: HEAD resolving to a commit, then a branch at the same commit
+        let refs = vec![
+            UploadRef {
+                name: "HEAD".to_owned(),
+                oid: oid(b'a'),
+                peeled: None,
+            },
+            UploadRef {
+                name: "refs/heads/main".to_owned(),
+                oid: oid(b'a'),
+                peeled: None,
+            },
+        ];
+
+        // when
+        let mut out = Vec::new();
+        upload_pack_v0(&mut out, &refs, Some("refs/heads/main"), Kind::Sha1).expect("build");
+
+        // then: HEAD leads with the capabilities and the symref target after a
+        // NUL; the branch line is bare
+        let caps = format!(
+            "side-band-64k no-progress {} symref=HEAD:refs/heads/main",
+            agent_cap()
+        );
+        let mut expected = Vec::new();
+        expected.extend(pkt(b"# service=git-upload-pack\n"));
+        expected.extend_from_slice(FLUSH);
+        expected.extend(pkt(
+            format!("{} HEAD\0{caps}\n", oid(b'a').to_hex()).as_bytes()
+        ));
+        expected.extend(pkt(
+            format!("{} refs/heads/main\n", oid(b'a').to_hex()).as_bytes()
+        ));
+        expected.extend_from_slice(FLUSH);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn should_emit_a_peeled_line_after_an_annotated_tag() {
+        // given: a single tag ref with a peeled target and no HEAD (so no
+        // symref capability)
+        let refs = vec![UploadRef {
+            name: "refs/tags/v1".to_owned(),
+            oid: oid(b'b'),
+            peeled: Some(oid(b'c')),
+        }];
+
+        // when
+        let mut out = Vec::new();
+        upload_pack_v0(&mut out, &refs, None, Kind::Sha1).expect("build");
+
+        // then: the tag line carries the caps, immediately followed by its
+        // peeled `^{}` line
+        let caps = format!("side-band-64k no-progress {}", agent_cap());
+        let mut expected = Vec::new();
+        expected.extend(pkt(b"# service=git-upload-pack\n"));
+        expected.extend_from_slice(FLUSH);
+        expected.extend(pkt(format!(
+            "{} refs/tags/v1\0{caps}\n",
+            oid(b'b').to_hex()
+        )
+        .as_bytes()));
+        expected.extend(pkt(
+            format!("{} refs/tags/v1^{{}}\n", oid(b'c').to_hex()).as_bytes()
+        ));
+        expected.extend_from_slice(FLUSH);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn should_advertise_capabilities_on_the_null_line_for_an_empty_repo() {
+        // given/when: no resolvable refs at all
+        let mut out = Vec::new();
+        upload_pack_v0(&mut out, &[], None, Kind::Sha1).expect("build");
+
+        // then: the synthetic capabilities line carries the caps on the null oid
+        let caps = format!("side-band-64k no-progress {}", agent_cap());
+        let zeros = "0".repeat(40);
+        let mut expected = Vec::new();
+        expected.extend(pkt(b"# service=git-upload-pack\n"));
+        expected.extend_from_slice(FLUSH);
+        expected.extend(pkt(
+            format!("{zeros} capabilities^{{}}\0{caps}\n").as_bytes()
+        ));
+        expected.extend_from_slice(FLUSH);
+        assert_eq!(out, expected);
+    }
 }
