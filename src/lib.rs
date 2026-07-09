@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -71,6 +71,12 @@ impl AppState {
     }
 }
 
+/// Largest accepted request body. Push packs are buffered in memory before
+/// ingestion, so this cap is what bounds per-request memory rather than
+/// axum's 2 MiB default, which rejects any non-trivial push with 413.
+/// Streaming pack ingestion would remove the need for a buffer-sized cap.
+const MAX_REQUEST_BODY_BYTES: usize = 1 << 30;
+
 /// Build the axum application router.
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -81,7 +87,9 @@ pub fn app(state: AppState) -> Router {
         // path segment.
         .route(
             "/{*path}",
-            get(protocol::http::info_refs).post(protocol::http::git_rpc),
+            get(protocol::http::info_refs)
+                .post(protocol::http::git_rpc)
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn(access_log))
         .with_state(state)
