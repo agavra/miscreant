@@ -1,3 +1,4 @@
+```
 Miscreant Git Server
 ====================
 
@@ -90,3 +91,4 @@ Contact/Contribute
 AI contributions are welcome after submitting a human-written issue
 describing the problem/motivations. Any AI usage must disclose the
 model used.
+```
