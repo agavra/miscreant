@@ -6,9 +6,12 @@
 pub mod blobs;
 pub mod keys;
 pub mod objectdb;
+pub mod slatedb_metrics;
 pub mod store;
 pub mod values;
 
 pub use blobs::{BlobStore, BlobStoreError};
 pub use objectdb::{ObjectDb, ObjectDbError};
-pub use store::{Durability, RefOutcome, RefUpdate, RefUpdateResult, RepoMeta, Store, StoreError};
+pub use store::{
+    CacheConfig, Durability, RefOutcome, RefUpdate, RefUpdateResult, RepoMeta, Store, StoreError,
+};

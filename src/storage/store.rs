@@ -6,17 +6,28 @@
 //! `keys` codec and all values through the `values` codec; this module only
 //! layers SlateDB access and the repo lifecycle on top of them.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+};
+use futures::{StreamExt, TryStreamExt};
 use gix_hash::{Kind, ObjectId, oid};
 use slatedb::config::{PutOptions, WriteOptions};
+use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
+use slatedb::db_cache::{CachedEntry, DbCache};
+use slatedb::manifest::SsTableId;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::prefix::PrefixStore;
 use slatedb::object_store::{self, ObjectStore};
-use slatedb::{Db, ErrorKind, IsolationLevel, PrefixExtractor, PrefixTarget};
+use slatedb::{
+    CacheTarget, Db, DbCacheManagerOps, ErrorKind, IsolationLevel, PrefixExtractor, PrefixTarget,
+};
 use url::Url;
 
 use crate::storage::keys::{self, KeyError, RepoId, Segment};
+use crate::storage::slatedb_metrics::SlateDbMetricsBridge;
 use crate::storage::values::{CommitGraphRecord, MetaValue, ObjectRecord, RefTarget, ValueError};
 
 /// Child of the root object store that holds the SlateDB instance. Offloaded
@@ -81,6 +92,11 @@ const CREATE_ATTEMPTS: usize = 32;
 /// which every command is failed as `ng` (design: non-atomic ref updates).
 const UPDATE_REFS_ATTEMPTS: usize = 2;
 
+/// Concurrent `warm_sst` calls issued by [`Store::warm_cache`]. The cache
+/// manager leaves fan-out to callers; this width keeps the object store busy
+/// without letting a large manifest issue thousands of reads at once.
+const WARM_CONCURRENCY: usize = 16;
+
 /// Rejection reason when a ref's current value does not match `expected_old`:
 /// the ref moved under the client, so its update is not a fast-forward of the
 /// value the push claimed. Phrased the way git clients render a rejected ref.
@@ -107,6 +123,9 @@ pub enum StoreError {
     /// An error propagated from SlateDB.
     #[error("slatedb error: {0}")]
     Db(#[from] slatedb::Error),
+    /// Building or warming the hybrid block cache (foyer) failed.
+    #[error("block cache error: {0}")]
+    Cache(#[from] foyer::Error),
     /// A stored key could not be decoded (indicates corruption).
     #[error("malformed key in store: {0}")]
     Key(#[from] KeyError),
@@ -202,6 +221,21 @@ impl Durability {
     }
 }
 
+/// Block-cache configuration for [`Store::open_with_cache`]. The default
+/// (`dir` unset) leaves SlateDB on its built-in in-memory block cache; setting
+/// `dir` installs a foyer hybrid (memory + disk) cache whose disk tier lives
+/// at that path.
+#[derive(Debug, Clone, Default)]
+pub struct CacheConfig {
+    /// Directory for the disk tier of the hybrid block cache. `None` uses
+    /// SlateDB's default in-memory block cache.
+    pub dir: Option<PathBuf>,
+    /// Memory-tier capacity, in bytes. Meaningful only when `dir` is set.
+    pub memory_bytes: u64,
+    /// Disk-tier capacity, in bytes. Meaningful only when `dir` is set.
+    pub disk_bytes: u64,
+}
+
 /// Typed persistence over SlateDB plus the repository registry. Cheaply
 /// cloneable (shared handles behind `Arc`).
 #[derive(Clone)]
@@ -211,19 +245,87 @@ pub struct Store {
 }
 
 impl Store {
+    /// Open (or create) the store backing `storage_url` with SlateDB's default
+    /// in-memory block cache. Use [`Store::open_with_cache`] to install a
+    /// hybrid (memory + disk) block cache.
+    pub async fn open(storage_url: &str) -> Result<Self, StoreError> {
+        Self::open_with_cache(storage_url, &CacheConfig::default()).await
+    }
+
     /// Open (or create) the store backing `storage_url`. SlateDB is placed
     /// under the `slatedb/` prefix of the resolved object store; the root
-    /// store handle is retained for later blob offload.
-    pub async fn open(storage_url: &str) -> Result<Self, StoreError> {
+    /// store handle is retained for later blob offload. A metrics recorder
+    /// bridging SlateDB's internal metrics onto the `metrics`-rs facade is
+    /// always attached. When `cache.dir` is set, a foyer hybrid block cache is
+    /// installed with its disk tier at that path (created if missing);
+    /// otherwise SlateDB's default in-memory block cache is used.
+    pub async fn open_with_cache(
+        storage_url: &str,
+        cache: &CacheConfig,
+    ) -> Result<Self, StoreError> {
         let root_store = resolve_root_store(storage_url)?;
-        let db = Db::builder(Path::from(SLATEDB_PREFIX), root_store.clone())
+        let mut builder = Db::builder(Path::from(SLATEDB_PREFIX), root_store.clone())
             .with_segment_extractor(Arc::new(SegmentExtractor))
-            .build()
-            .await?;
+            .with_metrics_recorder(Arc::new(SlateDbMetricsBridge));
+        if let Some(dir) = &cache.dir {
+            let db_cache = build_hybrid_cache(dir, cache.memory_bytes, cache.disk_bytes).await?;
+            builder = builder.with_db_cache(db_cache);
+        }
+        let db = builder.build().await?;
         Ok(Self {
             db: Arc::new(db),
             root_store,
         })
+    }
+
+    /// Warm the block cache from the current manifest: enumerate every live
+    /// SST (root L0 + sorted runs, plus every segment's) and load its data,
+    /// index, and filter blocks. Returns the number of SSTs warmed. Fan-out is
+    /// bounded so a large manifest cannot flood the object store with reads.
+    ///
+    /// With SlateDB's default in-memory cache (no `cache.dir`), each
+    /// `warm_sst` is a documented no-op; this is only worthwhile once a hybrid
+    /// cache is installed. An SST that vanishes from the manifest mid-loop is
+    /// likewise a no-op, so a concurrent compaction cannot fail warming.
+    pub async fn warm_cache(&self) -> Result<usize, StoreError> {
+        let manifest = self.db.manifest();
+        let mut ids: Vec<SsTableId> = Vec::new();
+        ids.extend(manifest.l0().iter().map(|v| v.sst.id));
+        ids.extend(
+            manifest
+                .compacted()
+                .iter()
+                .flat_map(|sr| sr.sst_views.iter())
+                .map(|v| v.sst.id),
+        );
+        for seg in manifest.segments() {
+            ids.extend(seg.l0().iter().map(|v| v.sst.id));
+            ids.extend(
+                seg.compacted()
+                    .iter()
+                    .flat_map(|sr| sr.sst_views.iter())
+                    .map(|v| v.sst.id),
+            );
+        }
+
+        let count = ids.len();
+        futures::stream::iter(ids)
+            .map(|id| async move {
+                self.db
+                    .warm_sst(
+                        id,
+                        &[
+                            CacheTarget::data::<&[u8], _>(..),
+                            CacheTarget::Index,
+                            CacheTarget::Filters,
+                        ],
+                    )
+                    .await
+            })
+            .buffer_unordered(WARM_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(count)
     }
 
     /// The root object store (already offset by the URL's path component).
@@ -644,6 +746,34 @@ fn resolve_root_store(storage_url: &str) -> Result<Arc<dyn ObjectStore>, StoreEr
     } else {
         Ok(Arc::new(PrefixStore::new(store, path)))
     }
+}
+
+/// Build a foyer hybrid (memory + disk) block cache with its disk tier at
+/// `dir` (created if missing). The weighter is mandatory: without it foyer
+/// counts every entry as weight 1 and the byte capacities silently stop
+/// bounding the cache. The disk engine keeps foyer's default 16 MiB region
+/// size, so a large disk tier maps to a manageable number of region files
+/// rather than the hundreds of thousands a tiny region size would preallocate.
+async fn build_hybrid_cache(
+    dir: &std::path::Path,
+    memory_bytes: u64,
+    disk_bytes: u64,
+) -> Result<Arc<dyn DbCache>, StoreError> {
+    std::fs::create_dir_all(dir)?;
+    let cache = HybridCacheBuilder::new()
+        .with_name("miscreant-block-cache")
+        .memory(memory_bytes as usize)
+        .with_weighter(|_, v: &CachedEntry| v.size())
+        .storage()
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_engine_config(BlockEngineConfig::new(
+            FsDeviceBuilder::new(dir)
+                .with_capacity(disk_bytes as usize)
+                .build()?,
+        ))
+        .build()
+        .await?;
+    Ok(Arc::new(FoyerHybridCache::new_with_cache(cache)))
 }
 
 fn is_conflict(err: &slatedb::Error) -> bool {
@@ -1256,5 +1386,43 @@ mod tests {
         // then: the open succeeded against the persisted extractor name and
         // the data is intact.
         assert_eq!(found.map(|meta| meta.id), Some(created.id));
+    }
+
+    #[tokio::test]
+    async fn should_warm_cache_from_a_hybrid_block_cache() {
+        // given: a store on durable (file-backed) storage with a hybrid block
+        // cache whose disk tier is its own tempdir, holding written records.
+        let storage_dir = tempfile::tempdir().expect("storage tempdir");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let url = format!("file://{}", storage_dir.path().display());
+        let cache = CacheConfig {
+            dir: Some(cache_dir.path().to_path_buf()),
+            memory_bytes: 4 * 1024 * 1024,
+            disk_bytes: 128 * 1024 * 1024,
+        };
+        let store = Store::open_with_cache(&url, &cache)
+            .await
+            .expect("open store with hybrid cache");
+        let repo = store.create_repo("warm/me").await.expect("create").id;
+        for byte in b'a'..=b'f' {
+            store
+                .put_object(
+                    repo,
+                    &oid(byte),
+                    &ObjectRecord::BlobInline(Bytes::from_static(b"blob 1\0x")),
+                    Durability::Durable,
+                )
+                .await
+                .expect("put object");
+        }
+        store.flush().await.expect("flush");
+
+        // when: warming the cache from the manifest.
+        let first = store.warm_cache().await.expect("warm cache");
+
+        // then: warming succeeds and is idempotent — a second pass over the
+        // unchanged manifest warms the identical set of SSTs.
+        let second = store.warm_cache().await.expect("warm cache again");
+        assert_eq!(first, second);
     }
 }

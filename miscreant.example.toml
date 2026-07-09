@@ -21,6 +21,23 @@ auto_create_repos = true
 # typical Linux host.
 staging_root = "/tmp/miscreant-staging"
 
+# Directory for the disk tier of a hybrid (memory + disk) block cache. Left
+# unset (the built-in default), SlateDB uses its in-memory block cache. Set it
+# to install a foyer hybrid cache whose disk tier lives at this path.
+# cache_dir = "/var/cache/miscreant"
+
+# Memory-tier capacity of the hybrid block cache, in bytes (512 MiB). Only
+# meaningful when cache_dir is set.
+cache_memory_bytes = 536870912
+
+# Disk-tier capacity of the hybrid block cache, in bytes (32 GiB). Only
+# meaningful when cache_dir is set.
+cache_disk_bytes = 34359738368
+
+# Warm the block cache from the manifest at startup, before the listener binds,
+# so the first request is served hot. Requires cache_dir.
+warm_on_start = false
+
 # tracing-subscriber EnvFilter directive used when RUST_LOG is unset; RUST_LOG
 # always overrides this.
 log_filter = "info"

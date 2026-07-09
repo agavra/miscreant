@@ -8,6 +8,7 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+foyer = { version = "0.22.3", features = ["serde"] }
 futures = "0.3"
 gix-features = { version = "0.48.1", features = ["progress", "zlib"] }
 gix-hash = { version = "0.25.1", features = ["sha1", "sha256"] }
@@ -24,6 +25,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 slatedb = { version = "0.14.1", features = ["aws"] }
+slatedb-common = "0.14.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }

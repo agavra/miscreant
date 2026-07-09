@@ -49,6 +49,40 @@ pub struct Config {
     )]
     pub staging_root: PathBuf,
 
+    /// Directory for the disk tier of a hybrid (memory + disk) block cache.
+    /// Unset uses SlateDB's default in-memory block cache; set installs a
+    /// foyer hybrid cache whose disk tier lives here (created if missing).
+    #[arg(long, env = "MISCREANT_CACHE_DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Memory-tier capacity of the hybrid block cache, in bytes. Meaningful
+    /// only when `cache_dir` is set.
+    #[arg(
+        long,
+        env = "MISCREANT_CACHE_MEMORY_BYTES",
+        default_value_t = 536870912
+    )]
+    pub cache_memory_bytes: u64,
+
+    /// Disk-tier capacity of the hybrid block cache, in bytes. Meaningful only
+    /// when `cache_dir` is set.
+    #[arg(
+        long,
+        env = "MISCREANT_CACHE_DISK_BYTES",
+        default_value_t = 34359738368
+    )]
+    pub cache_disk_bytes: u64,
+
+    /// Warm the block cache from the manifest at startup, before the listener
+    /// binds, so the first request is served hot. Requires `cache_dir`.
+    #[arg(
+        long,
+        env = "MISCREANT_WARM_ON_START",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub warm_on_start: bool,
+
     /// TOML file supplying defaults for any of the flags/env vars above that
     /// were left unset (see `FileConfig`). A path that cannot be read or
     /// parsed is a startup error; there is no implicit discovery.
@@ -64,6 +98,10 @@ impl Default for Config {
             inline_threshold: 65536,
             auto_create_repos: true,
             staging_root: default_staging_root(),
+            cache_dir: None,
+            cache_memory_bytes: 536870912,
+            cache_disk_bytes: 34359738368,
+            warm_on_start: false,
             config_path: None,
         }
     }
@@ -152,6 +190,10 @@ pub struct FileConfig {
     pub inline_threshold: Option<usize>,
     pub auto_create_repos: Option<bool>,
     pub staging_root: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub cache_memory_bytes: Option<u64>,
+    pub cache_disk_bytes: Option<u64>,
+    pub warm_on_start: Option<bool>,
     pub log_filter: Option<String>,
 }
 
@@ -226,6 +268,32 @@ pub fn merge_file_config(
         && let Some(value) = &file.staging_root
     {
         config.staging_root = value.clone();
+    }
+    // `cache_dir` is an `Option` with no built-in default, so clap reports its
+    // source as absent (not `DefaultValue`) when neither `--cache-dir` nor
+    // `MISCREANT_CACHE_DIR` was given; the file supplies it only in that case,
+    // never overriding an explicit CLI/env value.
+    if !matches!(
+        matches.value_source("cache_dir"),
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    ) && let Some(value) = &file.cache_dir
+    {
+        config.cache_dir = Some(value.clone());
+    }
+    if left_at_default("cache_memory_bytes")
+        && let Some(value) = file.cache_memory_bytes
+    {
+        config.cache_memory_bytes = value;
+    }
+    if left_at_default("cache_disk_bytes")
+        && let Some(value) = file.cache_disk_bytes
+    {
+        config.cache_disk_bytes = value;
+    }
+    if left_at_default("warm_on_start")
+        && let Some(value) = file.warm_on_start
+    {
+        config.warm_on_start = value;
     }
     config
 }
@@ -356,6 +424,10 @@ mod tests {
             inline_threshold: Some(1024),
             auto_create_repos: Some(false),
             staging_root: Some(PathBuf::from("/tmp/from-file")),
+            cache_dir: Some(PathBuf::from("/var/cache/from-file")),
+            cache_memory_bytes: Some(1234),
+            cache_disk_bytes: Some(5678),
+            warm_on_start: Some(true),
             log_filter: None,
         };
 
@@ -368,6 +440,13 @@ mod tests {
         assert_eq!(merged.inline_threshold, 1024);
         assert!(!merged.auto_create_repos);
         assert_eq!(merged.staging_root, PathBuf::from("/tmp/from-file"));
+        assert_eq!(
+            merged.cache_dir,
+            Some(PathBuf::from("/var/cache/from-file"))
+        );
+        assert_eq!(merged.cache_memory_bytes, 1234);
+        assert_eq!(merged.cache_disk_bytes, 5678);
+        assert!(merged.warm_on_start);
     }
 
     #[test]
@@ -403,6 +482,10 @@ mod tests {
             ("MISCREANT_INLINE_THRESHOLD", "2048"),
             ("MISCREANT_AUTO_CREATE_REPOS", "false"),
             ("MISCREANT_STAGING_ROOT", "/tmp/from-env"),
+            ("MISCREANT_CACHE_DIR", "/var/cache/from-env"),
+            ("MISCREANT_CACHE_MEMORY_BYTES", "4096"),
+            ("MISCREANT_CACHE_DISK_BYTES", "8192"),
+            ("MISCREANT_WARM_ON_START", "true"),
         ]);
         let (config, matches) = parse_config(&["test"]);
         let file = FileConfig {
@@ -411,6 +494,10 @@ mod tests {
             inline_threshold: Some(1),
             auto_create_repos: Some(true),
             staging_root: Some(PathBuf::from("/tmp/from-file")),
+            cache_dir: Some(PathBuf::from("/var/cache/from-file")),
+            cache_memory_bytes: Some(1),
+            cache_disk_bytes: Some(2),
+            warm_on_start: Some(false),
             log_filter: None,
         };
 
@@ -423,6 +510,10 @@ mod tests {
         assert_eq!(merged.inline_threshold, 2048);
         assert!(!merged.auto_create_repos);
         assert_eq!(merged.staging_root, PathBuf::from("/tmp/from-env"));
+        assert_eq!(merged.cache_dir, Some(PathBuf::from("/var/cache/from-env")));
+        assert_eq!(merged.cache_memory_bytes, 4096);
+        assert_eq!(merged.cache_disk_bytes, 8192);
+        assert!(merged.warm_on_start);
     }
 
     #[test]
@@ -464,7 +555,9 @@ mod tests {
 
         // then: every documented default matches `Config::default()`, except
         // staging_root, whose parent (the system temp directory) is
-        // environment-specific — only its final path component is pinned.
+        // environment-specific — only its final path component is pinned — and
+        // cache_dir, which has no built-in default and so is shown only as a
+        // commented-out line (left unset when the file is parsed).
         let defaults = Config::default();
         assert_eq!(file.bind_addr, Some(defaults.bind_addr));
         assert_eq!(file.storage_url, Some(defaults.storage_url));
@@ -474,6 +567,9 @@ mod tests {
             file.staging_root.as_ref().and_then(|path| path.file_name()),
             defaults.staging_root.file_name(),
         );
+        assert_eq!(file.cache_memory_bytes, Some(defaults.cache_memory_bytes));
+        assert_eq!(file.cache_disk_bytes, Some(defaults.cache_disk_bytes));
+        assert_eq!(file.warm_on_start, Some(defaults.warm_on_start));
         assert_eq!(file.log_filter.as_deref(), Some(DEFAULT_LOG_FILTER));
     }
 }

@@ -17,7 +17,7 @@ use axum::routing::get;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 pub use crate::config::Config;
-use crate::storage::{BlobStore, ObjectDb, Store, StoreError};
+use crate::storage::{BlobStore, CacheConfig, ObjectDb, Store, StoreError};
 
 /// Shared state handed to every request handler.
 #[derive(Clone)]
@@ -54,7 +54,12 @@ impl AppState {
         metrics: PrometheusHandle,
     ) -> Result<Self, StoreError> {
         let storage_url = config::normalize_storage_url(&config.storage_url)?;
-        let store = Store::open(&storage_url).await?;
+        let cache = CacheConfig {
+            dir: config.cache_dir.clone(),
+            memory_bytes: config.cache_memory_bytes,
+            disk_bytes: config.cache_disk_bytes,
+        };
+        let store = Store::open_with_cache(&storage_url, &cache).await?;
         let blobs = BlobStore::new(store.object_store());
         let objectdb = ObjectDb::new(store.clone(), blobs, config.inline_threshold);
         Ok(Self {

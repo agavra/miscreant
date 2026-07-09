@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -95,12 +96,24 @@ async fn main() -> anyhow::Result<()> {
 /// Bind the configured address and serve the git HTTP(S) protocol until
 /// shutdown.
 async fn serve(config: Config) -> anyhow::Result<()> {
+    // Warming at startup only pays off against a persistent (hybrid) cache; the
+    // default in-memory cache is empty every boot, so reject the combination
+    // rather than silently doing nothing useful.
+    if config.warm_on_start && config.cache_dir.is_none() {
+        anyhow::bail!(
+            "--warm-on-start requires --cache-dir: there is no persistent block \
+             cache to warm otherwise"
+        );
+    }
+
     tracing::info!(
         storage_url = %redact_storage_url(&config.storage_url),
         bind_addr = %config.bind_addr,
         inline_threshold = config.inline_threshold,
         auto_create_repos = config.auto_create_repos,
         staging_root = %config.staging_root.display(),
+        cache_dir = ?config.cache_dir,
+        warm_on_start = config.warm_on_start,
         "starting"
     );
 
@@ -113,16 +126,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             )
         })?;
 
-    let listener = TcpListener::bind(config.bind_addr)
-        .await
-        .with_context(|| format!("failed to bind {}", config.bind_addr))?;
-    tracing::info!(addr = %config.bind_addr, "listening");
-
-    // Install the process-wide recorder before anything records through the
-    // `metrics` facade, and describe every metric only after installing it:
-    // `describe_*` targets whichever recorder is currently global, so an
-    // earlier call would register descriptions on the default no-op recorder
-    // and lose them.
+    // Install the process-wide recorder before opening the store: SlateDB's
+    // metrics bridge and any cache warming below both publish through the
+    // `metrics` facade, and `describe_*` targets whichever recorder is
+    // currently global, so an earlier describe would land on the default no-op
+    // recorder and be lost.
     let builder = miscreant::telemetry::configure_byte_buckets(PrometheusBuilder::new())
         .context("failed to configure metrics buckets")?;
     let metrics_handle = builder
@@ -133,6 +141,27 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let state = AppState::with_metrics(config, metrics_handle)
         .await
         .context("failed to open storage")?;
+
+    // Warm the cache before binding so the first request is served fully hot.
+    if state.config.warm_on_start {
+        let start = Instant::now();
+        let ssts = state
+            .store
+            .warm_cache()
+            .await
+            .context("failed to warm block cache")?;
+        tracing::info!(
+            ssts,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "warmed block cache"
+        );
+    }
+
+    let listener = TcpListener::bind(state.config.bind_addr)
+        .await
+        .with_context(|| format!("failed to bind {}", state.config.bind_addr))?;
+    tracing::info!(addr = %state.config.bind_addr, "listening");
+
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
