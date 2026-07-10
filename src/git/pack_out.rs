@@ -74,10 +74,19 @@ pub struct DeltaStats {
     pub comparisons: u64,
     /// Entries emitted as offset deltas.
     pub emitted: u64,
+    /// Blob bodies retained in the candidate window as future bases.
+    pub inserted: u64,
+    /// Stored bytes saved across emitted deltas: each entry's full zlib length
+    /// minus its emitted delta's compressed length, summed.
+    pub bytes_saved: u64,
     /// Time spent inflating eligible blob targets.
     pub inflate: Duration,
-    /// Time spent building and deflating candidate deltas.
-    pub encode: Duration,
+    /// Time spent building candidate base block indexes.
+    pub index: Duration,
+    /// Time spent scanning targets and emitting delta instructions.
+    pub scan: Duration,
+    /// Time spent deflating produced deltas.
+    pub deflate: Duration,
 }
 
 /// A failure while assembling or writing a pack stream.
@@ -233,9 +242,9 @@ impl DeltaCandidates {
             .filter(move |candidate| candidate.group == group)
     }
 
-    fn insert(&mut self, entry_index: usize, group: u32, body: Bytes) {
+    fn insert(&mut self, entry_index: usize, group: u32, body: Bytes) -> bool {
         if body.len() > MAX_DELTA_CACHE_BYTES {
-            return;
+            return false;
         }
         while self.bytes + body.len() > MAX_DELTA_CACHE_BYTES || self.entries.len() >= DELTA_WINDOW
         {
@@ -250,6 +259,7 @@ impl DeltaCandidates {
             group,
             body,
         });
+        true
     }
 }
 
@@ -278,12 +288,22 @@ fn delta_or_full<E: std::error::Error + 'static>(
         .ok_or_else(|| PackOutError::CorruptZlib { oid: object.id })?;
     stats.inflate += inflate_start.elapsed();
 
-    let encode_start = Instant::now();
     let mut best: Option<(usize, usize, usize, Vec<u8>)> = None;
     for candidate in candidates.matching(group) {
         stats.comparisons += 1;
-        let delta = make_delta(&candidate.body, &body);
+
+        let index_start = Instant::now();
+        let index = block_index(&candidate.body);
+        stats.index += index_start.elapsed();
+
+        let scan_start = Instant::now();
+        let delta = make_delta(&candidate.body, &body, &index);
+        stats.scan += scan_start.elapsed();
+
+        let deflate_start = Instant::now();
         let compressed = zlib::deflate(&delta, 6);
+        stats.deflate += deflate_start.elapsed();
+
         if compressed.len() + MIN_DELTA_SAVINGS >= object.zlib.len() {
             continue;
         }
@@ -299,10 +319,10 @@ fn delta_or_full<E: std::error::Error + 'static>(
             ));
         }
     }
-    stats.encode += encode_start.elapsed();
 
-    if let Some((base_index, delta_len, _, compressed_data)) = best {
+    if let Some((base_index, delta_len, compressed_len, compressed_data)) = best {
         stats.emitted += 1;
+        stats.bytes_saved += (object.zlib.len() - compressed_len) as u64;
         return Ok(output::Entry {
             id: object.id,
             kind: output::entry::Kind::DeltaRef {
@@ -315,20 +335,22 @@ fn delta_or_full<E: std::error::Error + 'static>(
 
     // A delta target is not a future base in this first implementation. This
     // keeps every chain at depth one and makes reconstruction cheap.
-    candidates.insert(entry_index, group, body);
+    if candidates.insert(entry_index, group, body) {
+        stats.inserted += 1;
+    }
     Ok(full_entry(object))
 }
 
-/// Produce Git's delta instruction stream for `target` relative to `base`.
-/// It is intentionally a bounded, deterministic implementation of the usual
-/// block-hash strategy: hash fixed base blocks, scan the target for matching
-/// blocks, extend each hit, and encode unmatched bytes as inserts.
-fn make_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+/// Produce Git's delta instruction stream for `target` relative to `base`,
+/// given `index`, `base`'s fixed-block hash index. It is intentionally a
+/// bounded, deterministic implementation of the usual block-hash strategy:
+/// scan the target for matching blocks, extend each hit, and encode unmatched
+/// bytes as inserts.
+fn make_delta(base: &[u8], target: &[u8], index: &HashMap<u64, Vec<usize>>) -> Vec<u8> {
     let mut out = Vec::new();
     encode_size(base.len() as u64, &mut out);
     encode_size(target.len() as u64, &mut out);
 
-    let index = block_index(base);
     let mut cursor = 0;
     let mut insert_start = 0;
     while cursor + MIN_COPY <= target.len() {
@@ -648,10 +670,13 @@ mod tests {
         .expect("write pack");
 
         // then: both blobs were inflated as delta targets and the second was
-        // emitted as an offset delta against the first
+        // emitted as an offset delta against the first, which was the only body
+        // retained as a base and whose delta saved stored bytes
         assert_eq!(stats.eligible, 2);
         assert_eq!(stats.comparisons, 1);
         assert_eq!(stats.emitted, 1);
+        assert_eq!(stats.inserted, 1);
+        assert!(stats.bytes_saved > 0);
 
         // then: the first blob is a full base and the second is an in-pack
         // offset delta. Pack checksum verification still succeeds.

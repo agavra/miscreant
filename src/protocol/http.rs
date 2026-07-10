@@ -5,6 +5,8 @@
 //! are addressed by the request path minus the endpoint suffix. The push RPC
 //! is served by `receive_pack`; the fetch RPC by `upload_pack`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -25,6 +27,16 @@ const RECEIVE_PACK: &str = "git-receive-pack";
 const SERVICE_UPLOAD_PACK: &str = "git-upload-pack";
 /// Service value selecting the push advertisement.
 const SERVICE_RECEIVE_PACK: &str = "git-receive-pack";
+
+/// Source of the per-request `req` correlation id stamped on each git request
+/// span, so events emitted while serving one request can be told apart from
+/// those of requests served concurrently.
+static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The next request-correlation id.
+fn next_request_id() -> u64 {
+    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// `GET /<repo>/info/refs?service=…` — the ref/service advertisement.
 ///
@@ -48,13 +60,23 @@ pub async fn info_refs(
 
     match service_param(query.as_deref()).as_deref() {
         Some(SERVICE_UPLOAD_PACK) => {
-            let span = tracing::debug_span!("advertise", repo = %repo, endpoint = "info/refs");
+            let span = tracing::debug_span!(
+                "advertise",
+                req = next_request_id(),
+                repo = %repo,
+                endpoint = "info/refs"
+            );
             upload_pack_advert(&state, &repo, &headers)
                 .instrument(span)
                 .await
         }
         Some(SERVICE_RECEIVE_PACK) => {
-            let span = tracing::debug_span!("advertise", repo = %repo, endpoint = "info/refs");
+            let span = tracing::debug_span!(
+                "advertise",
+                req = next_request_id(),
+                repo = %repo,
+                endpoint = "info/refs"
+            );
             receive_pack_advert(&state, &repo).instrument(span).await
         }
         _ => plain(
@@ -78,7 +100,12 @@ pub async fn git_rpc(
             Ok(name) => name,
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
-        let span = tracing::debug_span!("receive_pack", repo = %repo, endpoint = "receive-pack");
+        let span = tracing::debug_span!(
+            "receive_pack",
+            req = next_request_id(),
+            repo = %repo,
+            endpoint = "receive-pack"
+        );
         receive_pack::receive_pack(&state, &repo, body)
             .instrument(span)
             .await
@@ -87,7 +114,12 @@ pub async fn git_rpc(
             Ok(name) => name,
             Err(RepoNameError) => return plain(StatusCode::BAD_REQUEST, "invalid repository name"),
         };
-        let span = tracing::debug_span!("upload_pack", repo = %repo, endpoint = "upload-pack");
+        let span = tracing::debug_span!(
+            "upload_pack",
+            req = next_request_id(),
+            repo = %repo,
+            endpoint = "upload-pack"
+        );
         // `git` sends the protocol-v2 header on the POST too when speaking v2,
         // so its presence selects the handler; its absence is the classic (v0)
         // protocol.

@@ -538,10 +538,28 @@ async fn feed_objects(
     let mut read_sum = Duration::ZERO;
     let mut read_max = Duration::ZERO;
     let mut send_wait = Duration::ZERO;
+    // Disjoint latency buckets over the per-object reads, so a slow tail shows
+    // up even when the sum and max are dominated by a few outliers.
+    let mut read_le_100us = 0u64;
+    let mut read_le_1ms = 0u64;
+    let mut read_le_10ms = 0u64;
+    let mut read_le_100ms = 0u64;
+    let mut read_gt_100ms = 0u64;
     while let Some((object, result, read)) = lookups.next().await {
         count += 1;
         read_sum += read;
         read_max = read_max.max(read);
+        if read <= Duration::from_micros(100) {
+            read_le_100us += 1;
+        } else if read <= Duration::from_millis(1) {
+            read_le_1ms += 1;
+        } else if read <= Duration::from_millis(10) {
+            read_le_10ms += 1;
+        } else if read <= Duration::from_millis(100) {
+            read_le_100ms += 1;
+        } else {
+            read_gt_100ms += 1;
+        }
         let item = match result {
             Ok(Some((kind, decompressed_size, zlib))) => Ok(PackEntry {
                 id: object.oid,
@@ -565,6 +583,11 @@ async fn feed_objects(
         objects = count,
         read_ms_sum = read_sum.as_millis() as u64,
         read_ms_max = read_max.as_millis() as u64,
+        read_le_100us,
+        read_le_1ms,
+        read_le_10ms,
+        read_le_100ms,
+        read_gt_100ms,
         send_wait_ms = send_wait.as_millis() as u64,
         wall_ms = wall.elapsed().as_millis() as u64,
         "objects fed"
@@ -746,8 +769,12 @@ fn emit_stream_event(
         delta_eligible = delta.eligible,
         delta_comparisons = delta.comparisons,
         delta_emitted = delta.emitted,
+        delta_inserted = delta.inserted,
+        delta_bytes_saved = delta.bytes_saved,
         delta_inflate_ms = delta.inflate.as_millis() as u64,
-        delta_encode_ms = delta.encode.as_millis() as u64,
+        delta_index_ms = delta.index.as_millis() as u64,
+        delta_scan_ms = delta.scan.as_millis() as u64,
+        delta_deflate_ms = delta.deflate.as_millis() as u64,
         "pack streamed"
     );
 }
