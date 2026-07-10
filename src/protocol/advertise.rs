@@ -123,7 +123,7 @@ pub fn upload_pack_v0(
     object_format: Kind,
 ) -> io::Result<()> {
     let mut caps = format!(
-        "multi_ack_detailed side-band-64k no-progress agent={}",
+        "multi_ack_detailed side-band-64k no-progress ofs-delta agent={}",
         agent()
     );
     if let Some(target) = head_symref_target {
@@ -210,7 +210,7 @@ mod tests {
         // then: HEAD leads with the capabilities and the symref target after a
         // NUL; the branch line is bare
         let caps = format!(
-            "multi_ack_detailed side-band-64k no-progress {} symref=HEAD:refs/heads/main",
+            "multi_ack_detailed side-band-64k no-progress ofs-delta {} symref=HEAD:refs/heads/main",
             agent_cap()
         );
         let mut expected = Vec::new();
@@ -243,7 +243,7 @@ mod tests {
         // then: the tag line carries the caps, immediately followed by its
         // peeled `^{}` line
         let caps = format!(
-            "multi_ack_detailed side-band-64k no-progress {}",
+            "multi_ack_detailed side-band-64k no-progress ofs-delta {}",
             agent_cap()
         );
         let mut expected = Vec::new();
@@ -269,7 +269,7 @@ mod tests {
 
         // then: the synthetic capabilities line carries the caps on the null oid
         let caps = format!(
-            "multi_ack_detailed side-band-64k no-progress {}",
+            "multi_ack_detailed side-band-64k no-progress ofs-delta {}",
             agent_cap()
         );
         let zeros = "0".repeat(40);

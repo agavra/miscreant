@@ -19,7 +19,7 @@
 //! directly. Pack bytes are streamed multiplexed over side-band-64k, never
 //! buffered whole.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
 use std::time::Instant;
@@ -37,8 +37,8 @@ use tracing::{Instrument, Span};
 
 use crate::AppState;
 use crate::error::{self, Class, Classify};
-use crate::git::pack_out::{PackEntry, PackOutError, write_pack};
-use crate::git::walk::{FilterSpec, WalkError, Walker};
+use crate::git::pack_out::{PackEntry, PackOptions, PackOutError, write_pack_with_options};
+use crate::git::walk::{CollectedObjects, FilterSpec, WalkError, Walker};
 use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
 use crate::storage::values::RefTarget;
@@ -69,6 +69,23 @@ const OBJECT_LOOKAHEAD: usize = 32;
 /// [`MAX_BAND_DATA`] bytes, so this bounds the response memory held per
 /// in-flight fetch.
 const BODY_CHANNEL_PACKETS: usize = 8;
+
+/// One object selected for a response pack. `delta_group` is a path-name hash
+/// assigned only to blobs discovered through a tree walk; it lets the pack
+/// writer search a bounded set of nearby, likely related bases.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScheduledObject {
+    oid: ObjectId,
+    delta_group: Option<u32>,
+}
+
+/// A fully scheduled response pack plus the common haves used for protocol
+/// acknowledgements.
+#[derive(Debug)]
+pub(super) struct PackPlan {
+    pub objects: Vec<ScheduledObject>,
+    pub common: Vec<ObjectId>,
+}
 
 /// Serve a `POST /<repo>/git-upload-pack` request. `repo` is the already
 /// validated repository name.
@@ -186,18 +203,25 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     }
 
     let walker = Walker::new(state.store.clone(), state.objectdb.clone(), meta.id);
-    let (collected, common) =
-        match plan_pack(&walker, &parsed.wants, &parsed.haves, &parsed.filter).await {
-            Ok(planned) => planned,
-            Err(err) => {
-                let class = error::classify(&err);
-                if matches!(class, Class::Client(_)) {
-                    metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
-                }
-                return error_response(class);
+    let plan = match plan_pack(
+        &walker,
+        &parsed.wants,
+        &parsed.haves,
+        &parsed.filter,
+        parsed.ofs_delta,
+    )
+    .await
+    {
+        Ok(planned) => planned,
+        Err(err) => {
+            let class = error::classify(&err);
+            if matches!(class, Class::Client(_)) {
+                metrics::counter!("fetch_total", "outcome" => "rejected").increment(1);
             }
-        };
-    let Ok(count) = u32::try_from(collected.len()) else {
+            return error_response(class);
+        }
+    };
+    let Ok(count) = u32::try_from(plan.objects.len()) else {
         return reject_fetch("too many objects for one pack");
     };
 
@@ -206,7 +230,7 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     tracing::debug!(
         wants = parsed.wants.len(),
         haves = parsed.haves.len(),
-        common = common.len(),
+        common = plan.common.len(),
         objects_packed = count,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "fetch planned"
@@ -214,7 +238,7 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     metrics::counter!("fetch_total", "outcome" => "ok").increment(1);
     metrics::histogram!("fetch_objects_packed").record(f64::from(count));
 
-    let prefix = match negotiation_prefix(parsed.done, &common) {
+    let prefix = match negotiation_prefix(parsed.done, &plan.common) {
         Ok(prefix) => prefix,
         Err(_) => return http::internal_error(),
     };
@@ -223,11 +247,12 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     stream_pack_response(
         state.objectdb.clone(),
         meta,
-        collected,
+        plan.objects,
         count,
         prefix,
         true,
         parsed.no_progress,
+        parsed.ofs_delta,
     )
 }
 
@@ -242,17 +267,18 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
 pub(super) fn stream_pack_response(
     objectdb: ObjectDb,
     meta: &RepoMeta,
-    collected: Vec<ObjectId>,
+    objects: Vec<ScheduledObject>,
     count: u32,
     prefix: Vec<u8>,
     sideband: bool,
     no_progress: bool,
+    ofs_deltas: bool,
 ) -> Response {
     let repo = meta.id;
     let object_hash = meta.object_format;
     let span = Span::current();
     let (object_tx, object_rx) = mpsc::channel(OBJECT_LOOKAHEAD);
-    tokio::spawn(feed_objects(objectdb, repo, collected, object_tx).instrument(span.clone()));
+    tokio::spawn(feed_objects(objectdb, repo, objects, object_tx).instrument(span.clone()));
 
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_PACKETS);
     tokio::task::spawn_blocking(move || {
@@ -264,6 +290,7 @@ pub(super) fn stream_pack_response(
             object_hash,
             sideband,
             no_progress,
+            ofs_deltas,
         );
     });
 
@@ -294,23 +321,130 @@ pub(super) async fn plan_pack(
     wants: &[ObjectId],
     haves: &[ObjectId],
     filter: &FilterSpec,
-) -> Result<(Vec<ObjectId>, Vec<ObjectId>), WalkError> {
+    ofs_deltas: bool,
+) -> Result<PackPlan, WalkError> {
     let partition = walker.partition_wants(wants).await?;
     if partition.history.is_empty() {
-        return Ok((partition.direct, Vec::new()));
+        return Ok(PackPlan {
+            objects: plain_schedule(partition.direct),
+            common: Vec::new(),
+        });
     }
 
     let selection = walker.select_commits(&partition.history, haves).await?;
-    let mut collected = walker
-        .collect(&selection.to_send, &selection.common, filter)
-        .await?;
-    let mut seen: HashSet<ObjectId> = collected.iter().copied().collect();
+    let mut collected = if ofs_deltas {
+        walker
+            .collect_with_paths(&selection.to_send, &selection.common, filter)
+            .await?
+    } else {
+        CollectedObjects {
+            objects: walker
+                .collect(&selection.to_send, &selection.common, filter)
+                .await?,
+            blob_paths: HashMap::new(),
+        }
+    };
+    let mut seen: HashSet<ObjectId> = collected.objects.iter().copied().collect();
     for oid in partition.direct {
         if seen.insert(oid) {
-            collected.push(oid);
+            collected.objects.push(oid);
         }
     }
-    Ok((collected, selection.common))
+    let objects = if ofs_deltas {
+        schedule_for_ofs(walker, collected).await?
+    } else {
+        plain_schedule(collected.objects)
+    };
+    Ok(PackPlan {
+        objects,
+        common: selection.common,
+    })
+}
+
+/// Preserve Phase II's deterministic object order when the client did not
+/// negotiate offset deltas. This keeps the usual fetch path entirely free of
+/// delta planning and blob inflation.
+fn plain_schedule(objects: Vec<ObjectId>) -> Vec<ScheduledObject> {
+    objects
+        .into_iter()
+        .map(|oid| ScheduledObject {
+            oid,
+            delta_group: None,
+        })
+        .collect()
+}
+
+/// Git-inspired pack scheduling for `OFS_DELTA`: non-blobs retain their walk
+/// order, while path-discovered blobs are grouped by a suffix-biased path hash
+/// and then by exact path and size. This puts likely related revisions close
+/// together before the bounded delta window runs, without retaining blob
+/// contents in the plan.
+async fn schedule_for_ofs(
+    walker: &Walker,
+    collected: CollectedObjects,
+) -> Result<Vec<ScheduledObject>, WalkError> {
+    let info: HashMap<ObjectId, (Kind, u64)> = walker
+        .object_info(&collected.objects)
+        .await?
+        .into_iter()
+        .map(|(oid, kind, size)| (oid, (kind, size)))
+        .collect();
+    let mut fixed = Vec::new();
+    let mut blobs = Vec::new();
+    for (position, oid) in collected.objects.into_iter().enumerate() {
+        let Some(path) = collected.blob_paths.get(&oid) else {
+            fixed.push((
+                position,
+                ScheduledObject {
+                    oid,
+                    delta_group: None,
+                },
+            ));
+            continue;
+        };
+        let (kind, size) = info[&oid];
+        if kind != Kind::Blob {
+            fixed.push((
+                position,
+                ScheduledObject {
+                    oid,
+                    delta_group: None,
+                },
+            ));
+            continue;
+        }
+        blobs.push((name_hash(path), path.clone(), size, position, oid));
+    }
+    blobs.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    fixed.sort_by_key(|(position, _)| *position);
+    let mut scheduled = fixed
+        .into_iter()
+        .map(|(_, object)| object)
+        .collect::<Vec<_>>();
+    scheduled.extend(
+        blobs
+            .into_iter()
+            .map(|(group, _, _, _, oid)| ScheduledObject {
+                oid,
+                delta_group: Some(group),
+            }),
+    );
+    Ok(scheduled)
+}
+
+/// A stable, suffix-biased path hash. Exact paths are still a secondary sort
+/// key, while suffix affinity gives renamed files in similar directories a
+/// chance to share the bounded candidate window.
+fn name_hash(path: &[u8]) -> u32 {
+    path.iter().rev().fold(5381u32, |hash, byte| {
+        hash.wrapping_mul(33).wrapping_add(u32::from(*byte))
+    })
 }
 
 /// The pkt-lines that precede the pack bytes. Without `done` this is the
@@ -344,24 +478,25 @@ fn negotiation_prefix(done: bool, common: &[ObjectId]) -> io::Result<Vec<u8>> {
 async fn feed_objects(
     objectdb: ObjectDb,
     repo: RepoId,
-    oids: Vec<ObjectId>,
+    objects: Vec<ScheduledObject>,
     tx: mpsc::Sender<Result<PackEntry, FetchObjectError>>,
 ) {
-    let mut lookups = stream::iter(oids)
-        .map(|oid| {
+    let mut lookups = stream::iter(objects)
+        .map(|object| {
             let objectdb = objectdb.clone();
-            async move { (oid, objectdb.read_compressed(repo, &oid).await) }
+            async move { (object, objectdb.read_compressed(repo, &object.oid).await) }
         })
         .buffered(OBJECT_LOOKAHEAD);
-    while let Some((oid, result)) = lookups.next().await {
+    while let Some((object, result)) = lookups.next().await {
         let item = match result {
             Ok(Some((kind, decompressed_size, zlib))) => Ok(PackEntry {
-                id: oid,
+                id: object.oid,
                 kind,
                 decompressed_size,
                 zlib,
+                delta_group: object.delta_group,
             }),
-            Ok(None) => Err(FetchObjectError::Missing(oid)),
+            Ok(None) => Err(FetchObjectError::Missing(object.oid)),
             Err(err) => Err(FetchObjectError::Objects(err)),
         };
         let stop = item.is_err();
@@ -389,6 +524,7 @@ fn stream_pack(
     object_hash: gix_hash::Kind,
     sideband: bool,
     no_progress: bool,
+    ofs_deltas: bool,
 ) {
     let input = std::iter::from_fn(|| objects.blocking_recv());
     if !sideband {
@@ -397,7 +533,13 @@ fn stream_pack(
             buf: Vec::new(),
             bytes_written: 0,
         };
-        let outcome = write_pack(input, count, object_hash, &mut writer);
+        let outcome = write_pack_with_options(
+            input,
+            count,
+            object_hash,
+            &mut writer,
+            PackOptions { ofs_deltas },
+        );
         metrics::histogram!("fetch_pack_bytes").record(writer.bytes_written as f64);
         if let Err(err) = outcome
             && !is_broken_pipe(&err)
@@ -420,7 +562,13 @@ fn stream_pack(
         buf: Vec::new(),
         bytes_written: 0,
     };
-    let outcome = write_pack(input, count, object_hash, &mut writer);
+    let outcome = write_pack_with_options(
+        input,
+        count,
+        object_hash,
+        &mut writer,
+        PackOptions { ofs_deltas },
+    );
     // Counted here because this is where the true byte count exists: bytes
     // actually handed to the response channel, whether the pack completed or
     // ended mid-stream (a client abort still moved this many bytes).
@@ -573,17 +721,19 @@ struct FetchArgs {
     done: bool,
     /// Suppress side-band progress messages.
     no_progress: bool,
+    /// The client accepts in-pack offset deltas.
+    ofs_delta: bool,
     /// The partial-clone filter restricting which blobs are sent.
     filter: FilterSpec,
 }
 
 impl FetchArgs {
-    /// Parse `fetch` argument lines. `thin-pack`, `ofs-delta`, and
-    /// `include-tag` are accepted and ignored: the server only sends full
-    /// (non-delta) entries, which every client accepts, and tag objects are
-    /// sent only for explicitly wanted tag refs. A `filter` argument naming a
-    /// spec [`FilterSpec::parse`] does not recognize, or any other
-    /// unrecognized argument, is rejected with the returned `ERR` message.
+    /// Parse `fetch` argument lines. `ofs-delta` enables self-contained blob
+    /// deltas; `thin-pack` remains accepted but has no effect until ref-delta
+    /// support is added. Tag objects are sent only for explicitly wanted tag
+    /// refs. A `filter` argument naming a spec [`FilterSpec::parse`] does not
+    /// recognize, or any other unrecognized argument, is rejected with the
+    /// returned `ERR` message.
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut parsed = FetchArgs::default();
         for arg in args {
@@ -602,7 +752,8 @@ impl FetchArgs {
                 match arg.as_str() {
                     "done" => parsed.done = true,
                     "no-progress" => parsed.no_progress = true,
-                    "thin-pack" | "ofs-delta" | "include-tag" => {}
+                    "ofs-delta" => parsed.ofs_delta = true,
+                    "thin-pack" | "include-tag" => {}
                     other => return Err(format!("unexpected fetch argument: {other}")),
                 }
             }
@@ -1135,11 +1286,13 @@ mod tests {
         // when
         let parsed = FetchArgs::parse(&args).expect("parse args");
 
-        // then: wants/haves keep order; ignored args set no flags
+        // then: wants/haves keep order; ofs-delta is honored while the
+        // unsupported thin-pack/include-tag variants remain harmless.
         assert_eq!(parsed.wants, vec![oid(b'a'), oid(b'b')]);
         assert_eq!(parsed.haves, vec![oid(b'c')]);
         assert!(parsed.done);
         assert!(parsed.no_progress);
+        assert!(parsed.ofs_delta);
     }
 
     #[test]

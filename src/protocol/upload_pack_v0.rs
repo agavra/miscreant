@@ -182,18 +182,23 @@ async fn stream_done_round(
     request: &Request,
 ) -> Response {
     let start = Instant::now();
-    let (collected, common) =
-        match upload_pack::plan_pack(walker, &request.wants, &request.haves, &FilterSpec::None)
-            .await
-        {
-            Ok(planned) => planned,
-            Err(err) => return classify_walk_error(err),
-        };
-    let Ok(count) = u32::try_from(collected.len()) else {
+    let plan = match upload_pack::plan_pack(
+        walker,
+        &request.wants,
+        &request.haves,
+        &FilterSpec::None,
+        request.ofs_delta,
+    )
+    .await
+    {
+        Ok(planned) => planned,
+        Err(err) => return classify_walk_error(err),
+    };
+    let Ok(count) = u32::try_from(plan.objects.len()) else {
         return upload_pack::reject_fetch("too many objects for one pack");
     };
 
-    let prefix = match ack_done_line(&common) {
+    let prefix = match ack_done_line(&plan.common) {
         Ok(prefix) => prefix,
         Err(_) => return http::internal_error(),
     };
@@ -201,7 +206,7 @@ async fn stream_done_round(
     tracing::debug!(
         wants = request.wants.len(),
         haves = request.haves.len(),
-        common = common.len(),
+        common = plan.common.len(),
         objects_packed = count,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "fetch planned"
@@ -212,11 +217,12 @@ async fn stream_done_round(
     upload_pack::stream_pack_response(
         state.objectdb.clone(),
         meta,
-        collected,
+        plan.objects,
         count,
         prefix,
         request.side_band_64k,
         request.no_progress,
+        request.ofs_delta,
     )
 }
 
@@ -302,6 +308,8 @@ struct Request {
     side_band_64k: bool,
     /// The client asked to suppress side-band progress messages.
     no_progress: bool,
+    /// The client accepts in-pack offset deltas.
+    ofs_delta: bool,
     /// The client negotiated `multi_ack_detailed`, so negotiation rounds may
     /// carry `ACK <oid> common`/`ready` lines; without it only `NAK` is sent.
     multi_ack_detailed: bool,
@@ -390,6 +398,7 @@ fn parse_caps(caps: &str, request: &mut Request) {
             "side-band-64k" => request.side_band_64k = true,
             "no-progress" => request.no_progress = true,
             "multi_ack_detailed" => request.multi_ack_detailed = true,
+            "ofs-delta" => request.ofs_delta = true,
             _ => {}
         }
     }
@@ -417,7 +426,7 @@ mod tests {
         // given: a clone request — a first want carrying capabilities, a second
         // bare want, a flush, then done
         let mut body = pkt(format!(
-            "want {} multi_ack_detailed side-band-64k no-progress agent=git/2.43\n",
+            "want {} multi_ack_detailed side-band-64k no-progress ofs-delta agent=git/2.43\n",
             oid(b'a')
         )
         .as_bytes());
@@ -434,6 +443,7 @@ mod tests {
         assert!(request.multi_ack_detailed);
         assert!(request.side_band_64k);
         assert!(request.no_progress);
+        assert!(request.ofs_delta);
         assert!(request.done);
         assert!(request.haves.is_empty());
     }

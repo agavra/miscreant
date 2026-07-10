@@ -39,7 +39,7 @@ fn expected_upload_advert() -> Vec<u8> {
 /// since HEAD is unborn).
 fn expected_empty_upload_advert_v0() -> Vec<u8> {
     let caps = format!(
-        "multi_ack_detailed side-band-64k no-progress {}",
+        "multi_ack_detailed side-band-64k no-progress ofs-delta {}",
         agent_capability()
     );
     let zeros = "0".repeat(40);

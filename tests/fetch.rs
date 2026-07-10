@@ -1,12 +1,15 @@
 mod common;
 
 use std::collections::HashSet;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use common::{
     TestServer, commit_file, git, git_ok, init_repo, rev_objects, rev_parse, test_config,
 };
 use gix_object::Kind;
+use gix_pack::data::entry::Header;
+use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
 
 /// Commit identity flags for the hermetic `git` helper.
 const IDENTITY: [&str; 4] = [
@@ -288,6 +291,59 @@ async fn should_clone_pushed_history_with_a_clean_fsck() {
         std::fs::read(clone_dir.join("a.txt")).expect("read a.txt"),
         b"alpha\n"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_send_an_offset_delta_for_two_revisions_of_the_same_path() {
+    // given: a history containing two large, nearly identical revisions of
+    // one path. The deterministic bytes resist ordinary zlib compression, so
+    // the delta is materially smaller than a second full entry.
+    let server = TestServer::spawn(test_config()).await;
+    let local = server.tempdir().join("local-ofs");
+    init_repo(&local);
+    let mut state = 0x1234_5678u32;
+    let base: Vec<u8> = (0..64 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    commit_file(&local, "versioned.bin", &base, "base revision");
+    let mut target = base.clone();
+    target[32 * 1024] ^= 0xff;
+    let tip = commit_file(&local, "versioned.bin", &target, "target revision");
+    let url = format!("{}/proj.git", server.base_url());
+    git_ok(&local, &["push", &url, "main:refs/heads/main"]);
+
+    // when: a fresh protocol-v2 fetch explicitly accepts OFS_DELTA.
+    let body = fetch_body(&[&format!("want {tip}"), "ofs-delta", "done"]);
+    let response = post_upload_pack(&server.base_url(), "proj", body).await;
+    assert_eq!(response.status(), 200);
+    let pkts = parse_pkts(&response.bytes().await.expect("response body"));
+    let pack = extract_pack(&pkts);
+
+    // then: the response is a checksum-valid pack with at least one offset
+    // delta, and Git itself can unpack the complete, self-contained result.
+    let entries: Vec<_> = BytesToEntriesIter::new_from_header(
+        BufReader::new(pack.as_slice()),
+        Mode::Verify,
+        EntryDataMode::Keep,
+        gix_hash::Kind::Sha1,
+    )
+    .expect("read pack header")
+    .collect::<Result<_, _>>()
+    .expect("verify pack");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry.header, Header::OfsDelta { .. })),
+        "expected an OFS_DELTA entry"
+    );
+    let unpacked = unpack_oids(&server, &pack, "unpack-ofs-delta");
+    assert!(unpacked.contains(&rev_parse(&local, "HEAD:versioned.bin")));
+    assert!(unpacked.contains(&rev_parse(&local, "HEAD~1:versioned.bin")));
 }
 
 #[tokio::test(flavor = "multi_thread")]

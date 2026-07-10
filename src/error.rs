@@ -141,7 +141,9 @@ impl<E: Classify + std::error::Error> Classify for PackOutError<E> {
             PackOutError::Input(e) => e.class(),
             // Output/hashing failures and a pack cut short of its declared
             // object count are both internal faults.
-            PackOutError::Write(_) | PackOutError::Truncated { .. } => Class::Server,
+            PackOutError::Write(_)
+            | PackOutError::CorruptZlib { .. }
+            | PackOutError::Truncated { .. } => Class::Server,
         }
     }
 }

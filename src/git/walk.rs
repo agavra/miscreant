@@ -23,7 +23,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
 use gix_hash::{ObjectId, oid};
-use gix_object::{CommitRef, Kind, TagRef, TreeRefIter};
+use gix_object::{CommitRef, Kind, TagRef, TreeRefIter, bstr::ByteSlice};
 
 use crate::storage::keys::RepoId;
 use crate::storage::values::{CommitGraphRecord, RefTarget};
@@ -264,12 +264,44 @@ impl Discovery {
 }
 
 /// A tree entry relevant to the walk. Gitlink (submodule) entries reference
-/// objects that live in another repository and are skipped entirely.
+/// objects that live in another repository and are skipped entirely. Names
+/// are raw Git path components, never assumed to be UTF-8.
 enum TreeEntry {
     /// A subtree to descend into.
-    Subtree(ObjectId),
+    Subtree {
+        oid: ObjectId,
+        name: Option<Vec<u8>>,
+    },
     /// A blob or symlink: a leaf that is sent but never descended into.
-    Leaf(ObjectId),
+    Leaf {
+        oid: ObjectId,
+        name: Option<Vec<u8>>,
+    },
+}
+
+/// The Phase-II object set together with one repository-relative path for
+/// each blob reached through a tree walk. The object list remains
+/// insertion-ordered; `blob_paths` is only a packing hint, and a blob wanted
+/// directly by oid has no such hint.
+#[derive(Debug, Default)]
+pub struct CollectedObjects {
+    /// Every object that belongs in the response pack.
+    pub objects: Vec<ObjectId>,
+    /// A deterministic, first-seen path for each selected blob.
+    pub blob_paths: HashMap<ObjectId, Vec<u8>>,
+}
+
+/// Append one raw tree-entry name to `parent`, producing a repository-relative
+/// Git path. Tree names cannot contain `/`, so the separator is unambiguous.
+fn join_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    if parent.is_empty() {
+        return name.to_vec();
+    }
+    let mut path = Vec::with_capacity(parent.len() + 1 + name.len());
+    path.extend_from_slice(parent);
+    path.push(b'/');
+    path.extend_from_slice(name);
+    path
 }
 
 /// An insertion-ordered set of object ids: the backing set memoizes
@@ -357,6 +389,21 @@ impl Walker {
             history,
             direct: direct.into_vec(),
         })
+    }
+
+    /// Return the kind and content size for every object in `ids`, preserving
+    /// input order. This is the pack planner's metadata-only pass: it groups
+    /// selected blobs by name and size without fetching their contents.
+    pub async fn object_info(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, Kind, u64)>, WalkError> {
+        let mut info = Vec::with_capacity(ids.len());
+        for (id, size) in self.object_sizes(ids).await {
+            let (kind, size) = size?.ok_or(WalkError::MissingObject(id))?;
+            info.push((id, kind, size));
+        }
+        Ok(info)
     }
 
     /// Bulk-recompute the commit-graph record for every commit reachable
@@ -669,6 +716,32 @@ impl Walker {
         haves: &[ObjectId],
         filter: &FilterSpec,
     ) -> Result<Vec<ObjectId>, WalkError> {
+        Ok(self
+            .collect_inner(to_send, haves, filter, false)
+            .await?
+            .objects)
+    }
+
+    /// Like [`Self::collect`], but retains one full repository-relative path
+    /// for every selected blob. This is a pack-planning hint: it lets the
+    /// send side group likely related blob revisions without changing which
+    /// objects Phase II selects.
+    pub async fn collect_with_paths(
+        &self,
+        to_send: &[ObjectId],
+        haves: &[ObjectId],
+        filter: &FilterSpec,
+    ) -> Result<CollectedObjects, WalkError> {
+        self.collect_inner(to_send, haves, filter, true).await
+    }
+
+    async fn collect_inner(
+        &self,
+        to_send: &[ObjectId],
+        haves: &[ObjectId],
+        filter: &FilterSpec,
+        record_paths: bool,
+    ) -> Result<CollectedObjects, WalkError> {
         // Prefetch every have's record at once, then walk all recognized haves'
         // root trees together. Mirror discovery's excusing: an unknown (or
         // non-commit) have is ignored; deeper misses are corruption and error.
@@ -702,13 +775,21 @@ impl Walker {
         }
 
         let mut objects = OrderedOidSet::default();
+        let mut blob_paths = HashMap::new();
         for (id, kind) in classified {
             match kind {
                 Kind::Commit => {
                     objects.insert(id);
                     let root_tree = records[&id].root_tree;
-                    self.walk_tree(root_tree, &mut objects, &have_objects, filter)
-                        .await?;
+                    self.walk_tree(
+                        root_tree,
+                        &mut objects,
+                        &mut blob_paths,
+                        &have_objects,
+                        filter,
+                        record_paths,
+                    )
+                    .await?;
                 }
                 Kind::Tag => objects.insert(id),
                 actual => {
@@ -720,7 +801,10 @@ impl Walker {
                 }
             }
         }
-        Ok(objects.into_vec())
+        Ok(CollectedObjects {
+            objects: objects.into_vec(),
+            blob_paths,
+        })
     }
 
     /// Resolve raw wants into commit wants plus the annotated tag objects to
@@ -903,10 +987,10 @@ impl Walker {
         }
         while !level.is_empty() {
             let mut next = Vec::new();
-            for entries in self.read_trees(&level).await? {
+            for entries in self.read_trees(&level, false).await? {
                 for entry in entries {
                     match entry {
-                        TreeEntry::Subtree(child) => {
+                        TreeEntry::Subtree { oid: child, .. } => {
                             // Marking on discovery (rather than when the child
                             // is read) dedups the next level up front; the set
                             // ends up identical either way.
@@ -914,7 +998,7 @@ impl Walker {
                                 next.push(child);
                             }
                         }
-                        TreeEntry::Leaf(child) => {
+                        TreeEntry::Leaf { oid: child, .. } => {
                             if !matches!(filter, FilterSpec::BlobNone) {
                                 have_objects.insert(child);
                             }
@@ -944,42 +1028,65 @@ impl Walker {
         &self,
         root_tree: ObjectId,
         objects: &mut OrderedOidSet,
+        blob_paths: &mut HashMap<ObjectId, Vec<u8>>,
         have_objects: &HashSet<ObjectId>,
         filter: &FilterSpec,
+        record_paths: bool,
     ) -> Result<(), WalkError> {
         let mut level = Vec::new();
         if !objects.contains(&root_tree) && !have_objects.contains(&root_tree) {
             objects.insert(root_tree);
-            level.push(root_tree);
+            level.push((root_tree, Vec::new()));
         }
         while !level.is_empty() {
             let mut next = Vec::new();
             let mut blob_candidates = Vec::new();
             let mut candidate_seen = HashSet::new();
-            for entries in self.read_trees(&level).await? {
+            let tree_ids: Vec<ObjectId> = level.iter().map(|(oid, _)| *oid).collect();
+            for ((_, parent_path), entries) in level
+                .into_iter()
+                .zip(self.read_trees(&tree_ids, record_paths).await?)
+            {
                 for entry in entries {
                     match entry {
-                        TreeEntry::Subtree(child) => {
+                        TreeEntry::Subtree { oid: child, name } => {
                             if !objects.contains(&child) && !have_objects.contains(&child) {
                                 objects.insert(child);
-                                next.push(child);
+                                let path = if record_paths {
+                                    join_path(
+                                        &parent_path,
+                                        name.as_deref().expect("named tree entry"),
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                next.push((child, path));
                             }
                         }
                         // A blob is a candidate only when the client's
                         // have-frontier lacks it and it is not already
                         // collected; the filter has the final say below.
-                        TreeEntry::Leaf(child) => {
+                        TreeEntry::Leaf { oid: child, name } => {
                             if !have_objects.contains(&child)
                                 && !objects.contains(&child)
                                 && candidate_seen.insert(child)
                             {
-                                blob_candidates.push(child);
+                                let path = if record_paths {
+                                    join_path(
+                                        &parent_path,
+                                        name.as_deref().expect("named tree entry"),
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                blob_candidates.push((child, path));
                             }
                         }
                     }
                 }
             }
-            self.admit_blobs(blob_candidates, objects, filter).await?;
+            self.admit_blobs(blob_candidates, objects, blob_paths, filter, record_paths)
+                .await?;
             level = next;
         }
         Ok(())
@@ -992,22 +1099,33 @@ impl Walker {
     /// batch and never fetching any blob's content.
     async fn admit_blobs(
         &self,
-        candidates: Vec<ObjectId>,
+        candidates: Vec<(ObjectId, Vec<u8>)>,
         objects: &mut OrderedOidSet,
+        blob_paths: &mut HashMap<ObjectId, Vec<u8>>,
         filter: &FilterSpec,
+        record_paths: bool,
     ) -> Result<(), WalkError> {
         match *filter {
             FilterSpec::None => {
-                for child in candidates {
+                for (child, path) in candidates {
                     objects.insert(child);
+                    if record_paths {
+                        blob_paths.entry(child).or_insert(path);
+                    }
                 }
             }
             FilterSpec::BlobNone => {}
             FilterSpec::BlobLimit(limit) => {
-                for (child, size) in self.object_sizes(&candidates).await {
+                let ids: Vec<ObjectId> = candidates.iter().map(|(id, _)| *id).collect();
+                for ((child, path), (_, size)) in
+                    candidates.into_iter().zip(self.object_sizes(&ids).await)
+                {
                     let (_, size) = size?.ok_or(WalkError::MissingObject(child))?;
                     if size <= limit {
                         objects.insert(child);
+                        if record_paths {
+                            blob_paths.entry(child).or_insert(path);
+                        }
                     }
                 }
             }
@@ -1018,7 +1136,7 @@ impl Walker {
     /// Read and parse a tree object into walk-relevant entries, dropping
     /// gitlink (submodule) entries, whose targets live in other
     /// repositories.
-    async fn read_tree(&self, id: &oid) -> Result<Vec<TreeEntry>, WalkError> {
+    async fn read_tree(&self, id: &oid, include_names: bool) -> Result<Vec<TreeEntry>, WalkError> {
         let Some((kind, body)) = self.objects.get(self.repo, id).await? else {
             return Err(WalkError::MissingObject(id.to_owned()));
         };
@@ -1036,9 +1154,15 @@ impl Walker {
                 source,
             })?;
             if entry.mode.is_tree() {
-                entries.push(TreeEntry::Subtree(entry.oid.to_owned()));
+                entries.push(TreeEntry::Subtree {
+                    oid: entry.oid.to_owned(),
+                    name: include_names.then(|| entry.filename.as_bytes().to_vec()),
+                });
             } else if !entry.mode.is_commit() {
-                entries.push(TreeEntry::Leaf(entry.oid.to_owned()));
+                entries.push(TreeEntry::Leaf {
+                    oid: entry.oid.to_owned(),
+                    name: include_names.then(|| entry.filename.as_bytes().to_vec()),
+                });
             }
         }
         Ok(entries)
@@ -1049,9 +1173,13 @@ impl Walker {
     /// `ids`. Lookups run concurrently but results are yielded in input order,
     /// so the caller consumes them deterministically and the first failing
     /// tree (in input order) surfaces its error.
-    async fn read_trees(&self, ids: &[ObjectId]) -> Result<Vec<Vec<TreeEntry>>, WalkError> {
+    async fn read_trees(
+        &self,
+        ids: &[ObjectId],
+        include_names: bool,
+    ) -> Result<Vec<Vec<TreeEntry>>, WalkError> {
         stream::iter(ids.iter().copied())
-            .map(|id| async move { self.read_tree(&id).await })
+            .map(|id| async move { self.read_tree(&id, include_names).await })
             .buffered(WALK_LOOKAHEAD)
             .collect::<Vec<_>>()
             .await
