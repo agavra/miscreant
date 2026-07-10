@@ -11,7 +11,7 @@
 //! header — the pack writer never recompresses.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -34,8 +34,31 @@ const MAX_DELTA_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// Avoid changing the entry form for negligible savings once its pack header
 /// and offset are included.
 const MIN_DELTA_SAVINGS: usize = 32;
-/// Minimum exact match that is worth encoding as a copy instruction.
+/// Minimum exact match that is worth encoding as a copy instruction. This is
+/// also the block-hash window over which both sides of a comparison agree.
 const MIN_COPY: usize = 16;
+/// At most this many base offsets are indexed per block tag.
+const MAX_BLOCK_MATCHES: usize = 4;
+/// A block index entry lives within this many slots of its home slot, and a
+/// lookup examines exactly this many.
+const PROBE_WINDOW: usize = 8;
+/// Odd multiplier for the multiplicative Rabin-Karp block fingerprint; large
+/// so windows spread across index slots.
+const HASH_BASE: u64 = 0x9e37_79b9_7f4a_7c15;
+/// `HASH_BASE` raised to the leading window position, the coefficient of the
+/// byte that leaves the window when the hash rolls forward.
+const HASH_TOP: u64 = wrapping_pow(HASH_BASE, (MIN_COPY - 1) as u32);
+
+/// Wrapping exponentiation usable in a `const` initializer.
+const fn wrapping_pow(base: u64, exp: u32) -> u64 {
+    let mut acc = 1u64;
+    let mut n = 0;
+    while n < exp {
+        acc = acc.wrapping_mul(base);
+        n += 1;
+    }
+    acc
+}
 
 /// A ready-to-pack object: its id and kind, the size its content decompresses
 /// to, and the zlib stream copied verbatim into the pack body.
@@ -83,9 +106,9 @@ pub struct DeltaStats {
     pub inflate: Duration,
     /// Time spent building candidate base block indexes.
     pub index: Duration,
-    /// Time spent scanning targets and emitting delta instructions.
+    /// Time spent scanning targets and building raw delta instructions.
     pub scan: Duration,
-    /// Time spent deflating produced deltas.
+    /// Time spent deflating the smallest raw delta selected for each target.
     pub deflate: Duration,
 }
 
@@ -288,7 +311,11 @@ fn delta_or_full<E: std::error::Error + 'static>(
         .ok_or_else(|| PackOutError::CorruptZlib { oid: object.id })?;
     stats.inflate += inflate_start.elapsed();
 
-    let mut best: Option<(usize, usize, usize, Vec<u8>)> = None;
+    // A depth-1 delta larger than half the target is not worth keeping, and
+    // each accepted candidate tightens the budget so a smaller raw delta is
+    // required to displace it.
+    let mut budget = body.len() / 2;
+    let mut best: Option<(usize, Vec<u8>)> = None;
     for candidate in candidates.matching(group) {
         stats.comparisons += 1;
 
@@ -297,40 +324,32 @@ fn delta_or_full<E: std::error::Error + 'static>(
         stats.index += index_start.elapsed();
 
         let scan_start = Instant::now();
-        let delta = make_delta(&candidate.body, &body, &index);
+        let delta = make_delta(&candidate.body, &body, &index, budget);
         stats.scan += scan_start.elapsed();
 
+        if let Some(delta) = delta {
+            budget = delta.len().saturating_sub(1);
+            best = Some((candidate.entry_index, delta));
+        }
+    }
+
+    if let Some((base_index, delta)) = best {
         let deflate_start = Instant::now();
         let compressed = zlib::deflate(&delta, 6);
         stats.deflate += deflate_start.elapsed();
 
-        if compressed.len() + MIN_DELTA_SAVINGS >= object.zlib.len() {
-            continue;
+        if compressed.len() + MIN_DELTA_SAVINGS < object.zlib.len() {
+            stats.emitted += 1;
+            stats.bytes_saved += (object.zlib.len() - compressed.len()) as u64;
+            return Ok(output::Entry {
+                id: object.id,
+                kind: output::entry::Kind::DeltaRef {
+                    object_index: base_index,
+                },
+                decompressed_size: delta.len(),
+                compressed_data: compressed,
+            });
         }
-        if best
-            .as_ref()
-            .is_none_or(|(_, _, best_len, _)| compressed.len() < *best_len)
-        {
-            best = Some((
-                candidate.entry_index,
-                delta.len(),
-                compressed.len(),
-                compressed,
-            ));
-        }
-    }
-
-    if let Some((base_index, delta_len, compressed_len, compressed_data)) = best {
-        stats.emitted += 1;
-        stats.bytes_saved += (object.zlib.len() - compressed_len) as u64;
-        return Ok(output::Entry {
-            id: object.id,
-            kind: output::entry::Kind::DeltaRef {
-                object_index: base_index,
-            },
-            decompressed_size: delta_len,
-            compressed_data,
-        });
     }
 
     // A delta target is not a future base in this first implementation. This
@@ -342,33 +361,47 @@ fn delta_or_full<E: std::error::Error + 'static>(
 }
 
 /// Produce Git's delta instruction stream for `target` relative to `base`,
-/// given `index`, `base`'s fixed-block hash index. It is intentionally a
-/// bounded, deterministic implementation of the usual block-hash strategy:
-/// scan the target for matching blocks, extend each hit, and encode unmatched
-/// bytes as inserts.
-fn make_delta(base: &[u8], target: &[u8], index: &HashMap<u64, Vec<usize>>) -> Vec<u8> {
+/// given `index`, `base`'s fixed-block hash index, or `None` once the raw
+/// output would exceed `max_size`. A rolling window hash walks the target: on
+/// a miss the window slides one byte in O(1), on a hit the matched run is
+/// copied and the window is re-primed just past it. Every hit is verified
+/// byte-for-byte, unmatched bytes are encoded as inserts, and the final
+/// `MIN_COPY`-byte tail that can no longer form a window is always an insert.
+fn make_delta(base: &[u8], target: &[u8], index: &BlockIndex, max_size: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     encode_size(base.len() as u64, &mut out);
     encode_size(target.len() as u64, &mut out);
 
     let mut cursor = 0;
     let mut insert_start = 0;
+    let mut hash = 0u64;
+    let mut primed = false;
     while cursor + MIN_COPY <= target.len() {
-        let hash = block_hash(&target[cursor..cursor + MIN_COPY]);
+        // The committed output plus the pending literal run bounds the raw
+        // delta so far; a comparison that has already lost is dropped here.
+        if out.len() + (cursor - insert_start) > max_size {
+            return None;
+        }
+        if !primed {
+            hash = block_hash(&target[cursor..cursor + MIN_COPY]);
+            primed = true;
+        }
+
+        let (window, tag) = index.window_of(hash);
+        let mut nominated = false;
+        for &entry in window {
+            nominated |= entry >> 32 == tag;
+        }
+
         let mut best = None;
-        if let Some(offsets) = index.get(&hash) {
-            for &offset in offsets.iter().take(4) {
-                if base[offset..offset + MIN_COPY] != target[cursor..cursor + MIN_COPY] {
+        if nominated {
+            for &entry in window {
+                if entry >> 32 != tag || entry as u32 == 0 {
                     continue;
                 }
-                let mut len = MIN_COPY;
-                while offset + len < base.len()
-                    && cursor + len < target.len()
-                    && base[offset + len] == target[cursor + len]
-                {
-                    len += 1;
-                }
-                if best.is_none_or(|(_, best_len)| len > best_len) {
+                let offset = (entry as u32 - 1) as usize;
+                let len = common_prefix(&base[offset..], &target[cursor..]);
+                if len >= MIN_COPY && best.is_none_or(|(_, best_len)| len > best_len) {
                     best = Some((offset, len));
                 }
             }
@@ -379,37 +412,130 @@ fn make_delta(base: &[u8], target: &[u8], index: &HashMap<u64, Vec<usize>>) -> V
             append_copy(&mut out, offset, len);
             cursor += len;
             insert_start = cursor;
+            primed = false;
         } else {
+            let arriving = cursor + MIN_COPY;
+            if arriving < target.len() {
+                hash = roll_hash(hash, target[cursor], target[arriving]);
+            }
             cursor += 1;
         }
     }
     append_insert(&mut out, &target[insert_start..]);
-    out
+    (out.len() <= max_size).then_some(out)
 }
 
-/// Index fixed-size base blocks by a small stable hash. A stride equal to the
-/// match size bounds index memory while target scanning still finds shifted
-/// runs after an insertion or deletion.
-fn block_index(base: &[u8]) -> HashMap<u64, Vec<usize>> {
-    let mut index = HashMap::new();
+/// Base block offsets keyed by their window fingerprint. Every entry lives
+/// within [`PROBE_WINDOW`] slots of its fingerprint's home slot, so a lookup
+/// examines exactly that many slots with branch-free tag compares — the
+/// target scan probes once per position, and a per-slot branch that depends
+/// on occupancy would stall it on mispredictions.
+struct BlockIndex {
+    /// Packed entries, `tag << 32 | offset + 1`; zero marks a free slot. The
+    /// length is a power of two plus [`PROBE_WINDOW`] trailing slots so a
+    /// probe window never wraps.
+    slots: Vec<u64>,
+    /// Right shift that turns a mixed fingerprint into its home slot.
+    shift: u32,
+}
+
+impl BlockIndex {
+    fn home_of(&self, fingerprint: u64) -> usize {
+        (fingerprint.wrapping_mul(HASH_BASE) >> self.shift) as usize
+    }
+
+    /// The probe window holding `fingerprint`'s entries, and the tag they
+    /// carry. A tag match only nominates an offset — the caller verifies the
+    /// bytes — so a colliding tag costs one failed verification and nothing
+    /// more.
+    fn window_of(&self, fingerprint: u64) -> (&[u64; PROBE_WINDOW], u64) {
+        let home = self.home_of(fingerprint);
+        let window = self.slots[home..home + PROBE_WINDOW]
+            .try_into()
+            .expect("windowful of slots");
+        (window, fingerprint >> 32)
+    }
+
+    /// Record a block, keeping at most [`MAX_BLOCK_MATCHES`] offsets per tag
+    /// (in insertion order). A block whose probe window is full goes
+    /// unindexed; a run through it can still be matched starting from a
+    /// neighboring block's offset.
+    fn insert(&mut self, fingerprint: u64, offset: usize) {
+        let home = self.home_of(fingerprint);
+        let tag = fingerprint >> 32;
+        let mut duplicates = 0;
+        for slot in home..home + PROBE_WINDOW {
+            let entry = self.slots[slot];
+            if entry == 0 {
+                self.slots[slot] = (tag << 32) | (offset as u64 + 1);
+                return;
+            }
+            if entry >> 32 == tag {
+                duplicates += 1;
+                if duplicates >= MAX_BLOCK_MATCHES {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Index fixed-size base blocks by their window fingerprint. A stride equal
+/// to the match size bounds index memory while target scanning still finds
+/// shifted runs after an insertion or deletion.
+fn block_index(base: &[u8]) -> BlockIndex {
+    let blocks = base.len() / MIN_COPY;
+    let homes = (blocks * 4).next_power_of_two().max(PROBE_WINDOW);
+    let mut index = BlockIndex {
+        slots: vec![0; homes + PROBE_WINDOW],
+        shift: 64 - homes.trailing_zeros(),
+    };
     if base.len() < MIN_COPY {
         return index;
     }
-    for offset in (0..=base.len().saturating_sub(MIN_COPY)).step_by(MIN_COPY) {
-        index
-            .entry(block_hash(&base[offset..offset + MIN_COPY]))
-            .or_insert_with(Vec::new)
-            .push(offset);
+    for offset in (0..=base.len() - MIN_COPY).step_by(MIN_COPY) {
+        index.insert(block_hash(&base[offset..offset + MIN_COPY]), offset);
     }
     index
 }
 
-/// A stable FNV-1a block hash. It only selects candidates; every hit is
-/// verified byte-for-byte before it becomes a copy instruction.
-fn block_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+/// Length of the common prefix of `a` and `b`, compared a word at a time so
+/// verifying and extending a fingerprint hit costs far less than a byte loop
+/// over the matched run.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let limit = a.len().min(b.len());
+    let mut len = 0;
+    while len + 8 <= limit {
+        let x = u64::from_le_bytes(a[len..len + 8].try_into().expect("8-byte chunk"));
+        let y = u64::from_le_bytes(b[len..len + 8].try_into().expect("8-byte chunk"));
+        if x != y {
+            return len + ((x ^ y).trailing_zeros() / 8) as usize;
+        }
+        len += 8;
+    }
+    while len < limit && a[len] == b[len] {
+        len += 1;
+    }
+    len
+}
+
+/// A multiplicative Rabin-Karp block fingerprint over a fixed window, computed
+/// in Horner form so it agrees with [`roll_hash`]'s incremental update. It only
+/// selects candidates; every hit is verified byte-for-byte before it becomes a
+/// copy instruction.
+fn block_hash(window: &[u8]) -> u64 {
+    window.iter().fold(0u64, |hash, byte| {
+        hash.wrapping_mul(HASH_BASE).wrapping_add(u64::from(*byte))
     })
+}
+
+/// Slide the block fingerprint one byte: drop `out_byte` from the front of the
+/// window and admit `in_byte` at the back, yielding what [`block_hash`] would
+/// compute for the shifted window.
+fn roll_hash(hash: u64, out_byte: u8, in_byte: u8) -> u64 {
+    hash.wrapping_sub(u64::from(out_byte).wrapping_mul(HASH_TOP))
+        .wrapping_mul(HASH_BASE)
+        .wrapping_add(u64::from(in_byte))
 }
 
 /// Encode a Git delta size varint.
@@ -630,6 +756,26 @@ mod tests {
 
         // then
         assert!(matches!(result, Err(PackOutError::Input(LookupFailed))));
+    }
+
+    #[test]
+    fn should_roll_the_block_hash_to_match_a_fresh_computation() {
+        // given: a sample buffer wider than the hash window
+        let buffer = random_body(4 * 1024);
+
+        // when: the hash rolls one byte at a time from the first window on
+        let mut rolled = block_hash(&buffer[..MIN_COPY]);
+
+        // then: every rolled value equals a freshly computed window hash
+        assert_eq!(rolled, block_hash(&buffer[..MIN_COPY]));
+        for start in 1..=buffer.len() - MIN_COPY {
+            rolled = roll_hash(rolled, buffer[start - 1], buffer[start - 1 + MIN_COPY]);
+            assert_eq!(
+                rolled,
+                block_hash(&buffer[start..start + MIN_COPY]),
+                "rolled hash diverged at position {start}"
+            );
+        }
     }
 
     #[test]
