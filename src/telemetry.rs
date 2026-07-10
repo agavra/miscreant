@@ -122,6 +122,26 @@ pub fn describe() {
         Unit::Bytes,
         "bytes of pack data actually streamed per served fetch"
     );
+    metrics::describe_histogram!(
+        "fetch_stream_seconds",
+        Unit::Seconds,
+        "wall-clock time writing and streaming the pack per served fetch"
+    );
+    metrics::describe_histogram!(
+        "fetch_stream_input_wait_seconds",
+        Unit::Seconds,
+        "time the pack writer spent blocked waiting for input objects per served fetch"
+    );
+    metrics::describe_histogram!(
+        "fetch_stream_output_wait_seconds",
+        Unit::Seconds,
+        "time the pack writer spent blocked on the response body channel per served fetch"
+    );
+    metrics::describe_histogram!(
+        "fetch_object_read_seconds",
+        Unit::Seconds,
+        "time to read one object's stored stream for packing, by source"
+    );
 
     metrics::describe_counter!(
         "store_cas_retries_total",

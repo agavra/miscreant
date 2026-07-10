@@ -12,6 +12,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gix_hash::ObjectId;
@@ -60,6 +61,23 @@ pub struct PackOptions {
     /// Emit in-pack offset deltas for scheduled blobs. Only set when the
     /// client explicitly requested `ofs-delta`.
     pub ofs_deltas: bool,
+}
+
+/// Delta-planning work performed while writing one pack. Every field stays
+/// zero unless `ofs_deltas` is set and at least one scheduled blob is
+/// size-eligible; the full-entry fast path touches none of it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeltaStats {
+    /// Size-eligible scheduled blobs inflated as delta targets.
+    pub eligible: u64,
+    /// Prior-base comparisons attempted across all eligible blobs.
+    pub comparisons: u64,
+    /// Entries emitted as offset deltas.
+    pub emitted: u64,
+    /// Time spent inflating eligible blob targets.
+    pub inflate: Duration,
+    /// Time spent building and deflating candidate deltas.
+    pub encode: Duration,
 }
 
 /// A failure while assembling or writing a pack stream.
@@ -113,12 +131,14 @@ where
     W: std::io::Write,
     E: std::error::Error + 'static,
 {
+    let mut stats = DeltaStats::default();
     write_pack_with_options(
         objects,
         num_objects,
         object_hash,
         out,
         PackOptions::default(),
+        &mut stats,
     )
 }
 
@@ -127,12 +147,16 @@ where
 /// in the same planner group are considered against a bounded cache of
 /// already-written full blobs; an `OFS_DELTA` is emitted only when its
 /// compressed instruction stream wins materially over the full stream.
+///
+/// `stats` accumulates the delta-planning work done along the way, populated
+/// as far as the write progressed even when it fails partway.
 pub fn write_pack_with_options<I, W, E>(
     objects: I,
     num_objects: u32,
     object_hash: gix_hash::Kind,
     out: W,
     options: PackOptions,
+    stats: &mut DeltaStats,
 ) -> Result<ObjectId, PackOutError<E>>
 where
     I: Iterator<Item = Result<PackEntry, E>>,
@@ -145,7 +169,7 @@ where
         let object = item.map_err(PackOutError::Input)?;
         let entry_index = written.get() as usize;
         let entry = if options.ofs_deltas {
-            delta_or_full(&object, entry_index, &mut candidates)?
+            delta_or_full(&object, entry_index, &mut candidates, stats)?
         } else {
             full_entry(&object)
         };
@@ -237,6 +261,7 @@ fn delta_or_full<E: std::error::Error + 'static>(
     object: &PackEntry,
     entry_index: usize,
     candidates: &mut DeltaCandidates,
+    stats: &mut DeltaStats,
 ) -> Result<output::Entry, PackOutError<E>> {
     let Some(group) = object.delta_group else {
         return Ok(full_entry(object));
@@ -247,10 +272,16 @@ fn delta_or_full<E: std::error::Error + 'static>(
         return Ok(full_entry(object));
     }
 
+    stats.eligible += 1;
+    let inflate_start = Instant::now();
     let body = zlib::inflate(&object.zlib, object.decompressed_size)
         .ok_or_else(|| PackOutError::CorruptZlib { oid: object.id })?;
+    stats.inflate += inflate_start.elapsed();
+
+    let encode_start = Instant::now();
     let mut best: Option<(usize, usize, usize, Vec<u8>)> = None;
     for candidate in candidates.matching(group) {
+        stats.comparisons += 1;
         let delta = make_delta(&candidate.body, &body);
         let compressed = zlib::deflate(&delta, 6);
         if compressed.len() + MIN_DELTA_SAVINGS >= object.zlib.len() {
@@ -268,8 +299,10 @@ fn delta_or_full<E: std::error::Error + 'static>(
             ));
         }
     }
+    stats.encode += encode_start.elapsed();
 
     if let Some((base_index, delta_len, _, compressed_data)) = best {
+        stats.emitted += 1;
         return Ok(output::Entry {
             id: object.id,
             kind: output::entry::Kind::DeltaRef {
@@ -601,6 +634,7 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
+        let mut stats = DeltaStats::default();
 
         // when
         write_pack_with_options(
@@ -609,8 +643,15 @@ mod tests {
             gix_hash::Kind::Sha1,
             &mut out,
             PackOptions { ofs_deltas: true },
+            &mut stats,
         )
         .expect("write pack");
+
+        // then: both blobs were inflated as delta targets and the second was
+        // emitted as an offset delta against the first
+        assert_eq!(stats.eligible, 2);
+        assert_eq!(stats.comparisons, 1);
+        assert_eq!(stats.emitted, 1);
 
         // then: the first blob is a full base and the second is an in-pack
         // offset delta. Pack checksum verification still succeeds.

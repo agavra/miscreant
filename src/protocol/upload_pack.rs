@@ -19,10 +19,11 @@
 //! directly. Pack bytes are streamed multiplexed over side-band-64k, never
 //! buffered whole.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -37,7 +38,9 @@ use tracing::{Instrument, Span};
 
 use crate::AppState;
 use crate::error::{self, Class, Classify};
-use crate::git::pack_out::{PackEntry, PackOptions, PackOutError, write_pack_with_options};
+use crate::git::pack_out::{
+    DeltaStats, PackEntry, PackOptions, PackOutError, write_pack_with_options,
+};
 use crate::git::walk::{CollectedObjects, FilterSpec, WalkError, Walker};
 use crate::protocol::{MAX_BAND_DATA, advertise, http};
 use crate::storage::keys::RepoId;
@@ -85,6 +88,23 @@ pub(super) struct ScheduledObject {
 pub(super) struct PackPlan {
     pub objects: Vec<ScheduledObject>,
     pub common: Vec<ObjectId>,
+    pub timings: PlanTimings,
+}
+
+/// Wall-clock time spent in each phase of [`plan_pack`], surfaced on the
+/// `fetch planned` event. A phase skipped for a given request (e.g. history
+/// selection when every want is a direct blob or tree) stays zero.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PlanTimings {
+    /// Sorting wants into history tips and direct backfill oids.
+    pub partition_wants: Duration,
+    /// Commit discovery against the client's haves.
+    pub select_commits: Duration,
+    /// Expanding selected commits into the objects to pack.
+    pub collect: Duration,
+    /// The offset-delta scheduling pass (an extra object-info read over every
+    /// collected object).
+    pub schedule_for_ofs: Duration,
 }
 
 /// Serve a `POST /<repo>/git-upload-pack` request. `repo` is the already
@@ -226,13 +246,18 @@ async fn fetch(state: &AppState, meta: &RepoMeta, args: &[String]) -> Response {
     };
 
     // The read-path story for one fetch. Timed to the point the pack is
-    // planned and streaming begins; the pack bytes flow out after this.
+    // planned and streaming begins; the pack bytes flow out after this. The
+    // per-phase fields break down where the planning time went.
     tracing::debug!(
         wants = parsed.wants.len(),
         haves = parsed.haves.len(),
         common = plan.common.len(),
         objects_packed = count,
         elapsed_ms = start.elapsed().as_millis() as u64,
+        partition_ms = plan.timings.partition_wants.as_millis() as u64,
+        select_ms = plan.timings.select_commits.as_millis() as u64,
+        collect_ms = plan.timings.collect.as_millis() as u64,
+        schedule_ms = plan.timings.schedule_for_ofs.as_millis() as u64,
         "fetch planned"
     );
     metrics::counter!("fetch_total", "outcome" => "ok").increment(1);
@@ -323,15 +348,24 @@ pub(super) async fn plan_pack(
     filter: &FilterSpec,
     ofs_deltas: bool,
 ) -> Result<PackPlan, WalkError> {
+    let mut timings = PlanTimings::default();
+
+    let phase = Instant::now();
     let partition = walker.partition_wants(wants).await?;
+    timings.partition_wants = phase.elapsed();
     if partition.history.is_empty() {
         return Ok(PackPlan {
             objects: plain_schedule(partition.direct),
             common: Vec::new(),
+            timings,
         });
     }
 
+    let phase = Instant::now();
     let selection = walker.select_commits(&partition.history, haves).await?;
+    timings.select_commits = phase.elapsed();
+
+    let phase = Instant::now();
     let mut collected = if ofs_deltas {
         walker
             .collect_with_paths(&selection.to_send, &selection.common, filter)
@@ -344,6 +378,7 @@ pub(super) async fn plan_pack(
             blob_paths: HashMap::new(),
         }
     };
+    timings.collect = phase.elapsed();
     let mut seen: HashSet<ObjectId> = collected.objects.iter().copied().collect();
     for oid in partition.direct {
         if seen.insert(oid) {
@@ -351,13 +386,17 @@ pub(super) async fn plan_pack(
         }
     }
     let objects = if ofs_deltas {
-        schedule_for_ofs(walker, collected).await?
+        let phase = Instant::now();
+        let scheduled = schedule_for_ofs(walker, collected).await?;
+        timings.schedule_for_ofs = phase.elapsed();
+        scheduled
     } else {
         plain_schedule(collected.objects)
     };
     Ok(PackPlan {
         objects,
         common: selection.common,
+        timings,
     })
 }
 
@@ -481,13 +520,28 @@ async fn feed_objects(
     objects: Vec<ScheduledObject>,
     tx: mpsc::Sender<Result<PackEntry, FetchObjectError>>,
 ) {
+    let wall = Instant::now();
     let mut lookups = stream::iter(objects)
         .map(|object| {
             let objectdb = objectdb.clone();
-            async move { (object, objectdb.read_compressed(repo, &object.oid).await) }
+            async move {
+                let read = Instant::now();
+                let result = objectdb.read_compressed(repo, &object.oid).await;
+                (object, result, read.elapsed())
+            }
         })
         .buffered(OBJECT_LOOKAHEAD);
-    while let Some((object, result)) = lookups.next().await {
+    // Results arrive in collected order, so `read_max` reflects head-of-line
+    // blocking and `read_sum` versus `wall` reflects the concurrency the
+    // lookahead actually won.
+    let mut count = 0u64;
+    let mut read_sum = Duration::ZERO;
+    let mut read_max = Duration::ZERO;
+    let mut send_wait = Duration::ZERO;
+    while let Some((object, result, read)) = lookups.next().await {
+        count += 1;
+        read_sum += read;
+        read_max = read_max.max(read);
         let item = match result {
             Ok(Some((kind, decompressed_size, zlib))) => Ok(PackEntry {
                 id: object.oid,
@@ -500,10 +554,21 @@ async fn feed_objects(
             Err(err) => Err(FetchObjectError::Objects(err)),
         };
         let stop = item.is_err();
-        if tx.send(item).await.is_err() || stop {
-            return;
+        let send = Instant::now();
+        let sent = tx.send(item).await;
+        send_wait += send.elapsed();
+        if sent.is_err() || stop {
+            break;
         }
     }
+    tracing::debug!(
+        objects = count,
+        read_ms_sum = read_sum.as_millis() as u64,
+        read_ms_max = read_max.as_millis() as u64,
+        send_wait_ms = send_wait.as_millis() as u64,
+        wall_ms = wall.elapsed().as_millis() as u64,
+        "objects fed"
+    );
 }
 
 /// The blocking half of the fetch response: pull ready-to-pack entries from
@@ -526,21 +591,51 @@ fn stream_pack(
     no_progress: bool,
     ofs_deltas: bool,
 ) {
-    let input = std::iter::from_fn(|| objects.blocking_recv());
+    let started = Instant::now();
+    // Time spent parked in `blocking_recv` — the writer starving for input —
+    // accumulates here as the pack writer pulls each entry.
+    let input_wait = Cell::new(Duration::ZERO);
+    let input = std::iter::from_fn(|| {
+        let recv = Instant::now();
+        let item = objects.blocking_recv();
+        input_wait.set(input_wait.get() + recv.elapsed());
+        item
+    });
+    let mut delta_stats = DeltaStats::default();
+
     if !sideband {
         let mut writer = RawWriter {
             tx: body.clone(),
             buf: Vec::new(),
             bytes_written: 0,
+            output_wait: Duration::ZERO,
+            first_byte: None,
+            started,
         };
+        let wall = Instant::now();
         let outcome = write_pack_with_options(
             input,
             count,
             object_hash,
             &mut writer,
             PackOptions { ofs_deltas },
+            &mut delta_stats,
         );
+        let wall = wall.elapsed();
         metrics::histogram!("fetch_pack_bytes").record(writer.bytes_written as f64);
+        if !matches!(&outcome, Err(err) if is_broken_pipe(err)) {
+            emit_stream_event(
+                count,
+                StreamStats {
+                    bytes: writer.bytes_written,
+                    output_wait: writer.output_wait,
+                    first_byte: writer.first_byte,
+                },
+                wall,
+                input_wait.get(),
+                &delta_stats,
+            );
+        }
         if let Err(err) = outcome
             && !is_broken_pipe(&err)
         {
@@ -561,18 +656,37 @@ fn stream_pack(
         tx: body.clone(),
         buf: Vec::new(),
         bytes_written: 0,
+        output_wait: Duration::ZERO,
+        first_byte: None,
+        started,
     };
+    let wall = Instant::now();
     let outcome = write_pack_with_options(
         input,
         count,
         object_hash,
         &mut writer,
         PackOptions { ofs_deltas },
+        &mut delta_stats,
     );
+    let wall = wall.elapsed();
     // Counted here because this is where the true byte count exists: bytes
     // actually handed to the response channel, whether the pack completed or
     // ended mid-stream (a client abort still moved this many bytes).
     metrics::histogram!("fetch_pack_bytes").record(writer.bytes_written as f64);
+    if !matches!(&outcome, Err(err) if is_broken_pipe(err)) {
+        emit_stream_event(
+            count,
+            StreamStats {
+                bytes: writer.bytes_written,
+                output_wait: writer.output_wait,
+                first_byte: writer.first_byte,
+            },
+            wall,
+            input_wait.get(),
+            &delta_stats,
+        );
+    }
     match outcome {
         Ok(_) => {
             if !no_progress {
@@ -596,6 +710,46 @@ fn stream_pack(
             let _ = send_band(&body, Channel::Error, reason.as_bytes());
         }
     }
+}
+
+/// The per-writer instrumentation [`emit_stream_event`] logs: bytes handed to
+/// the body channel, time blocked handing them over, and the latency to the
+/// first chunk. Both response-body writers expose it identically.
+struct StreamStats {
+    bytes: u64,
+    output_wait: Duration,
+    first_byte: Option<Duration>,
+}
+
+/// Emit the per-fetch stall decomposition once the pack write has finished.
+/// `wall` is the wall-clock of the write; subtracting `input_wait` (blocked on
+/// input) and the sink's output wait (blocked on the body channel) from it
+/// leaves the writer's own CPU time. The delta-planning fields attribute the
+/// share of that CPU spent inflating and encoding offset deltas.
+fn emit_stream_event(
+    count: u32,
+    sink: StreamStats,
+    wall: Duration,
+    input_wait: Duration,
+    delta: &DeltaStats,
+) {
+    metrics::histogram!("fetch_stream_seconds").record(wall.as_secs_f64());
+    metrics::histogram!("fetch_stream_input_wait_seconds").record(input_wait.as_secs_f64());
+    metrics::histogram!("fetch_stream_output_wait_seconds").record(sink.output_wait.as_secs_f64());
+    tracing::debug!(
+        objects = count,
+        bytes = sink.bytes,
+        wall_ms = wall.as_millis() as u64,
+        input_wait_ms = input_wait.as_millis() as u64,
+        output_wait_ms = sink.output_wait.as_millis() as u64,
+        first_byte_ms = sink.first_byte.map_or(0, |d| d.as_millis() as u64),
+        delta_eligible = delta.eligible,
+        delta_comparisons = delta.comparisons,
+        delta_emitted = delta.emitted,
+        delta_inflate_ms = delta.inflate.as_millis() as u64,
+        delta_encode_ms = delta.encode.as_millis() as u64,
+        "pack streamed"
+    );
 }
 
 /// Whether a pack-write failure is the client hanging up mid-stream (a broken
@@ -627,6 +781,27 @@ struct BandWriter {
     /// Total bytes handed to [`io::Write::write`] so far — the pack's true
     /// output size, independent of side-band/pkt-line framing overhead.
     bytes_written: u64,
+    /// Total time blocked handing completed packets to the body channel.
+    output_wait: Duration,
+    /// Latency from stream start to the first packet handed to the body
+    /// channel; `None` until a packet is sent.
+    first_byte: Option<Duration>,
+    /// When the stream began, the reference point for [`Self::first_byte`].
+    started: Instant,
+}
+
+impl BandWriter {
+    /// Frame `data` as a channel-1 packet and send it, recording the block
+    /// time and the first-byte latency.
+    fn send_data(&mut self, data: &[u8]) -> io::Result<()> {
+        let send = Instant::now();
+        let result = send_band(&self.tx, Channel::Data, data);
+        self.output_wait += send.elapsed();
+        if self.first_byte.is_none() {
+            self.first_byte = Some(self.started.elapsed());
+        }
+        result
+    }
 }
 
 impl io::Write for BandWriter {
@@ -636,7 +811,7 @@ impl io::Write for BandWriter {
         while self.buf.len() >= MAX_BAND_DATA {
             let rest = self.buf.split_off(MAX_BAND_DATA);
             let full = std::mem::replace(&mut self.buf, rest);
-            send_band(&self.tx, Channel::Data, &full)?;
+            self.send_data(&full)?;
         }
         Ok(data.len())
     }
@@ -644,7 +819,7 @@ impl io::Write for BandWriter {
     fn flush(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             let data = std::mem::take(&mut self.buf);
-            send_band(&self.tx, Channel::Data, &data)?;
+            self.send_data(&data)?;
         }
         Ok(())
     }
@@ -662,6 +837,30 @@ struct RawWriter {
     /// Total bytes handed to [`io::Write::write`] so far — the pack's true
     /// output size.
     bytes_written: u64,
+    /// Total time blocked handing completed chunks to the body channel.
+    output_wait: Duration,
+    /// Latency from stream start to the first chunk handed to the body
+    /// channel; `None` until a chunk is sent.
+    first_byte: Option<Duration>,
+    /// When the stream began, the reference point for [`Self::first_byte`].
+    started: Instant,
+}
+
+impl RawWriter {
+    /// Send `data` verbatim to the body channel, recording the block time and
+    /// the first-byte latency.
+    fn send_chunk(&mut self, data: Vec<u8>) -> io::Result<()> {
+        let send = Instant::now();
+        let result = self
+            .tx
+            .blocking_send(Bytes::from(data))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe));
+        self.output_wait += send.elapsed();
+        if self.first_byte.is_none() {
+            self.first_byte = Some(self.started.elapsed());
+        }
+        result
+    }
 }
 
 impl io::Write for RawWriter {
@@ -671,9 +870,7 @@ impl io::Write for RawWriter {
         while self.buf.len() >= MAX_BAND_DATA {
             let rest = self.buf.split_off(MAX_BAND_DATA);
             let full = std::mem::replace(&mut self.buf, rest);
-            self.tx
-                .blocking_send(Bytes::from(full))
-                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            self.send_chunk(full)?;
         }
         Ok(data.len())
     }
@@ -681,9 +878,7 @@ impl io::Write for RawWriter {
     fn flush(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             let data = std::mem::take(&mut self.buf);
-            self.tx
-                .blocking_send(Bytes::from(data))
-                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            self.send_chunk(data)?;
         }
         Ok(())
     }

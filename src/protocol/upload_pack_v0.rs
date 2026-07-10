@@ -209,6 +209,10 @@ async fn stream_done_round(
         common = plan.common.len(),
         objects_packed = count,
         elapsed_ms = start.elapsed().as_millis() as u64,
+        partition_ms = plan.timings.partition_wants.as_millis() as u64,
+        select_ms = plan.timings.select_commits.as_millis() as u64,
+        collect_ms = plan.timings.collect.as_millis() as u64,
+        schedule_ms = plan.timings.schedule_for_ofs.as_millis() as u64,
         "fetch planned"
     );
     metrics::counter!("fetch_total", "outcome" => "ok").increment(1);

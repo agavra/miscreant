@@ -9,6 +9,8 @@
 //! without inflating. See `docs/0001-init.md` §Overview (the 64KB
 //! inline-threshold split) and §Git Object Storage.
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use gix_hash::{ObjectId, oid};
 use gix_object::Kind;
@@ -169,12 +171,22 @@ impl ObjectDb {
         repo: RepoId,
         oid: &oid,
     ) -> Result<Option<(Kind, u64, Bytes)>, ObjectDbError> {
-        let Some(record) = self.store.get_object(repo, oid).await? else {
+        let record_start = Instant::now();
+        let record = self.store.get_object(repo, oid).await?;
+        metrics::histogram!("fetch_object_read_seconds", "source" => "record")
+            .record(record_start.elapsed().as_secs_f64());
+        let Some(record) = record else {
             return Ok(None);
         };
         let kind = record.kind();
         let (uncompressed_len, stream) = match record {
-            ObjectRecord::BlobPointer { size } => (size, self.blobs.get(oid).await?),
+            ObjectRecord::BlobPointer { size } => {
+                let blob_start = Instant::now();
+                let stream = self.blobs.get(oid).await?;
+                metrics::histogram!("fetch_object_read_seconds", "source" => "blob")
+                    .record(blob_start.elapsed().as_secs_f64());
+                (size, stream)
+            }
             ObjectRecord::BlobInline {
                 uncompressed_len,
                 zlib,
