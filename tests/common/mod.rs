@@ -21,6 +21,10 @@ pub mod oracle;
 #[allow(unused_imports)]
 pub use oracle::*;
 
+pub mod wire;
+#[allow(unused_imports)]
+pub use wire::*;
+
 /// A `Config` backed by an isolated in-memory store, suitable for tests that
 /// must not touch the filesystem or collide with other tests.
 #[allow(dead_code)]
