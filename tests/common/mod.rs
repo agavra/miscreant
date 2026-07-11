@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use gix_hash::ObjectId;
@@ -94,18 +94,33 @@ impl Drop for TestServer {
     }
 }
 
+/// The git wire protocol version a command negotiates, mapping to the
+/// `protocol.version=N` config value git is invoked with.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub enum Protocol {
+    V0,
+    V2,
+}
+
+impl Protocol {
+    /// The `protocol.version=N` config value for this protocol.
+    fn version(self) -> &'static str {
+        match self {
+            Protocol::V0 => "0",
+            Protocol::V2 => "2",
+        }
+    }
+}
+
 /// Build a real `git` CLI invocation in `dir` with a hermetic environment:
-/// protocol v2 forced, system config disabled, and `HOME` pointed at `dir`
+/// `protocol` forced, system config disabled, and `HOME` pointed at `dir`
 /// so host git configuration cannot leak into tests.
-fn git_command(dir: &Path, args: &[&str]) -> Command {
+fn git_command(dir: &Path, protocol: Protocol, args: &[&str]) -> Command {
     let mut command = Command::new("git");
+    let version = format!("protocol.version={}", protocol.version());
     command
-        .args([
-            "-c",
-            "protocol.version=2",
-            "-c",
-            "advice.detachedHead=false",
-        ])
+        .args(["-c", version.as_str(), "-c", "advice.detachedHead=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -113,16 +128,30 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
     command
 }
 
-/// Run the real `git` CLI in `dir` (see [`git_command`] for the environment).
+/// Run the real `git` CLI in `dir` under protocol v2 (see [`git_command`] for
+/// the environment).
 #[allow(dead_code)]
 pub fn git(dir: &Path, args: &[&str]) -> Output {
-    git_command(dir, args).output().expect("run git")
+    git_proto(dir, Protocol::V2, args)
 }
 
-/// Run `git` in `dir`, asserting success and returning stdout.
+/// Like [`git`], but under a chosen `protocol`.
+#[allow(dead_code)]
+pub fn git_proto(dir: &Path, protocol: Protocol, args: &[&str]) -> Output {
+    git_command(dir, protocol, args).output().expect("run git")
+}
+
+/// Run `git` in `dir` under protocol v2, asserting success and returning
+/// stdout.
 #[allow(dead_code)]
 pub fn git_ok(dir: &Path, args: &[&str]) -> Vec<u8> {
-    let output = git(dir, args);
+    git_ok_proto(dir, Protocol::V2, args)
+}
+
+/// Like [`git_ok`], but under a chosen `protocol`.
+#[allow(dead_code)]
+pub fn git_ok_proto(dir: &Path, protocol: Protocol, args: &[&str]) -> Vec<u8> {
+    let output = git_proto(dir, protocol, args);
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
@@ -135,7 +164,7 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> Vec<u8> {
 /// or `cat-file --batch`).
 #[allow(dead_code)]
 pub fn git_ok_with_input(dir: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-    let mut child = git_command(dir, args)
+    let mut child = git_command(dir, Protocol::V2, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -154,6 +183,24 @@ pub fn git_ok_with_input(dir: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+/// Clone `url` under `protocol` into `<server tempdir>/<name>`, asserting
+/// success, and return the clone's path.
+#[allow(dead_code)]
+pub fn clone_proto(server: &TestServer, protocol: Protocol, url: &str, name: &str) -> PathBuf {
+    let clone_dir = server.tempdir().join(name);
+    let clone = git_proto(
+        server.tempdir(),
+        protocol,
+        &["clone", url, clone_dir.to_str().expect("utf-8 clone path")],
+    );
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    clone_dir
 }
 
 /// Create an empty git repository at `dir` (made on demand) with `main` as
