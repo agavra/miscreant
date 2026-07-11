@@ -13,6 +13,10 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+pub mod invariant;
+#[allow(unused_imports)]
+pub use invariant::*;
+
 /// A `Config` backed by an isolated in-memory store, suitable for tests that
 /// must not touch the filesystem or collide with other tests.
 #[allow(dead_code)]
