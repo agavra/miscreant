@@ -17,6 +17,10 @@ pub mod invariant;
 #[allow(unused_imports)]
 pub use invariant::*;
 
+pub mod oracle;
+#[allow(unused_imports)]
+pub use oracle::*;
+
 /// A `Config` backed by an isolated in-memory store, suitable for tests that
 /// must not touch the filesystem or collide with other tests.
 #[allow(dead_code)]
