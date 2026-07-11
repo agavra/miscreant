@@ -8,15 +8,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
-};
 use futures::{StreamExt, TryStreamExt};
 use gix_hash::{Kind, ObjectId, oid};
 use slatedb::config::{PutOptions, WriteOptions};
-use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-use slatedb::db_cache::{CachedEntry, DbCache};
+use slatedb::db_cache::DbCache;
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::manifest::SsTableId;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::prefix::PrefixStore;
@@ -27,8 +25,23 @@ use slatedb::{
 use url::Url;
 
 use crate::storage::keys::{self, KeyError, RepoId, Segment};
+use crate::storage::part_cache::{
+    CachedObjectStore, CachedObjectStoreStats, FsCacheStorage, PartCacheError,
+};
 use crate::storage::slatedb_metrics::SlateDbMetricsBridge;
 use crate::storage::values::{CommitGraphRecord, MetaValue, ObjectRecord, RefTarget, ValueError};
+
+/// Fixed part size for the on-disk part cache. 4 MiB parts keep the number of
+/// part files manageable while amortizing each backend fetch across the many
+/// smaller block reads SlateDB issues within a part.
+const PART_CACHE_PART_SIZE: usize = 4 * 1024 * 1024;
+/// Interval between background scans that reconcile the part-cache directory
+/// with the evictor's in-memory accounting. Eviction itself is triggered in
+/// real time by cache writes; this scan only repairs drift (e.g. part files
+/// left behind by a crashed process).
+const PART_CACHE_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
+/// Upper bound on the number of part-file descriptors the cache keeps open.
+const PART_CACHE_MAX_OPEN_FILES: usize = 1024;
 
 /// Child of the root object store that holds the SlateDB instance. Offloaded
 /// blobs (added in a later change) live under a sibling prefix of the same
@@ -126,9 +139,9 @@ pub enum StoreError {
     /// An error propagated from SlateDB.
     #[error("slatedb error: {0}")]
     Db(#[from] slatedb::Error),
-    /// Building or warming the hybrid block cache (foyer) failed.
-    #[error("block cache error: {0}")]
-    Cache(#[from] foyer::Error),
+    /// Building the disk part cache failed.
+    #[error("part cache error: {0}")]
+    PartCache(#[from] PartCacheError),
     /// A stored key could not be decoded (indicates corruption).
     #[error("malformed key in store: {0}")]
     Key(#[from] KeyError),
@@ -224,18 +237,21 @@ impl Durability {
     }
 }
 
-/// Block-cache configuration for [`Store::open_with_cache`]. The default
-/// (`dir` unset) leaves SlateDB on its built-in in-memory block cache; setting
-/// `dir` installs a foyer hybrid (memory + disk) cache whose disk tier lives
-/// at that path.
+/// Cache configuration for [`Store::open_with_cache`]. The default (`dir`
+/// unset) leaves SlateDB on its built-in in-memory block cache and does not
+/// install a part cache. Setting `dir` installs a disk part cache at that path,
+/// shared by SlateDB's SST reads and offloaded-blob reads under one byte
+/// budget, and switches SlateDB's own block cache to a memory-only foyer cache.
 #[derive(Debug, Clone, Default)]
 pub struct CacheConfig {
-    /// Directory for the disk tier of the hybrid block cache. `None` uses
-    /// SlateDB's default in-memory block cache.
+    /// Directory holding the disk part cache. `None` uses SlateDB's default
+    /// in-memory block cache and installs no part cache.
     pub dir: Option<PathBuf>,
-    /// Memory-tier capacity, in bytes. Meaningful only when `dir` is set.
+    /// Capacity of the in-memory SlateDB block cache, in bytes. Meaningful only
+    /// when `dir` is set.
     pub memory_bytes: u64,
-    /// Disk-tier capacity, in bytes. Meaningful only when `dir` is set.
+    /// Byte budget for the whole disk part cache directory. Meaningful only
+    /// when `dir` is set.
     pub disk_bytes: u64,
 }
 
@@ -257,21 +273,56 @@ impl Store {
 
     /// Open (or create) the store backing `storage_url`. SlateDB is placed
     /// under the `slatedb/` prefix of the resolved object store; the root
-    /// store handle is retained for later blob offload. A metrics recorder
-    /// bridging SlateDB's internal metrics onto the `metrics`-rs facade is
-    /// always attached. When `cache.dir` is set, a foyer hybrid block cache is
-    /// installed with its disk tier at that path (created if missing);
-    /// otherwise SlateDB's default in-memory block cache is used.
+    /// store handle is retained for blob offload. A metrics recorder bridging
+    /// SlateDB's internal metrics onto the `metrics`-rs facade is always
+    /// attached.
+    ///
+    /// When `cache.dir` is set, the resolved root store is wrapped in a single
+    /// disk part cache at that path (created if missing) and the wrapped store
+    /// is used both for SlateDB and, via [`Store::object_store`], for offloaded
+    /// blobs — so one cache and one disk budget cover both. SlateDB's own block
+    /// cache is a memory-only foyer cache sized by `cache.memory_bytes`. With
+    /// `cache.dir` unset, no part cache is installed and SlateDB keeps its
+    /// default in-memory block cache.
     pub async fn open_with_cache(
         storage_url: &str,
         cache: &CacheConfig,
     ) -> Result<Self, StoreError> {
         let root_store = resolve_root_store(storage_url)?;
+        let (root_store, db_cache): (Arc<dyn ObjectStore>, Option<Arc<dyn DbCache>>) =
+            match &cache.dir {
+                Some(dir) => {
+                    std::fs::create_dir_all(dir)?;
+                    let stats = Arc::new(CachedObjectStoreStats::new());
+                    let cache_storage = Arc::new(FsCacheStorage::new(
+                        dir.clone(),
+                        Some(cache.disk_bytes as usize),
+                        Some(PART_CACHE_SCAN_INTERVAL),
+                        stats.clone(),
+                        PART_CACHE_MAX_OPEN_FILES,
+                    ));
+                    // `cache_puts = false`: the cache admits parts on a read
+                    // miss only. SlateDB's WAL/flush write churn would otherwise
+                    // pollute the cache, and the published 0.14.1 crate cannot
+                    // tag writes for the cache to distinguish them.
+                    let cached = CachedObjectStore::new(
+                        root_store,
+                        cache_storage,
+                        PART_CACHE_PART_SIZE,
+                        false,
+                        stats,
+                    )?;
+                    cached.start_evictor().await;
+                    let wrapped: Arc<dyn ObjectStore> = cached;
+                    let db_cache = build_memory_cache(cache.memory_bytes);
+                    (wrapped, Some(db_cache))
+                }
+                None => (root_store, None),
+            };
         let mut builder = Db::builder(Path::from(SLATEDB_PREFIX), root_store.clone())
             .with_segment_extractor(Arc::new(SegmentExtractor))
             .with_metrics_recorder(Arc::new(SlateDbMetricsBridge));
-        if let Some(dir) = &cache.dir {
-            let db_cache = build_hybrid_cache(dir, cache.memory_bytes, cache.disk_bytes).await?;
+        if let Some(db_cache) = db_cache {
             builder = builder.with_db_cache(db_cache);
         }
         let db = builder.build().await?;
@@ -286,10 +337,13 @@ impl Store {
     /// index, and filter blocks. Returns the number of SSTs warmed. Fan-out is
     /// bounded so a large manifest cannot flood the object store with reads.
     ///
-    /// With SlateDB's default in-memory cache (no `cache.dir`), each
-    /// `warm_sst` is a documented no-op; this is only worthwhile once a hybrid
-    /// cache is installed. An SST that vanishes from the manifest mid-loop is
-    /// likewise a no-op, so a concurrent compaction cannot fail warming.
+    /// `warm_sst` only no-ops when the database has no block cache at all
+    /// (`with_db_cache_disabled`); with any block cache configured — including
+    /// the memory-only foyer cache installed alongside a part cache — it issues
+    /// real object-store reads. Those reads flow through the wrapped store, so
+    /// warming also fills the disk part cache even though the block cache it
+    /// populates is memory-only. An SST that vanishes from the manifest mid-loop
+    /// is a no-op, so a concurrent compaction cannot fail warming.
     pub async fn warm_cache(&self) -> Result<usize, StoreError> {
         let manifest = self.db.manifest();
         let mut ids: Vec<SsTableId> = Vec::new();
@@ -331,8 +385,10 @@ impl Store {
         Ok(count)
     }
 
-    /// The root object store (already offset by the URL's path component).
-    /// Blob offload builds its `blobs/` prefix on top of this.
+    /// The root object store (already offset by the URL's path component),
+    /// wrapped in the disk part cache when one is configured. Blob offload
+    /// builds its `blobs/` prefix on top of this, so offloaded-blob reads flow
+    /// through the same part cache as SlateDB's SST reads.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.root_store.clone()
     }
@@ -766,32 +822,16 @@ fn resolve_root_store(storage_url: &str) -> Result<Arc<dyn ObjectStore>, StoreEr
     }
 }
 
-/// Build a foyer hybrid (memory + disk) block cache with its disk tier at
-/// `dir` (created if missing). The weighter is mandatory: without it foyer
-/// counts every entry as weight 1 and the byte capacities silently stop
-/// bounding the cache. The disk engine keeps foyer's default 16 MiB region
-/// size, so a large disk tier maps to a manageable number of region files
-/// rather than the hundreds of thousands a tiny region size would preallocate.
-async fn build_hybrid_cache(
-    dir: &std::path::Path,
-    memory_bytes: u64,
-    disk_bytes: u64,
-) -> Result<Arc<dyn DbCache>, StoreError> {
-    std::fs::create_dir_all(dir)?;
-    let cache = HybridCacheBuilder::new()
-        .with_name("miscreant-block-cache")
-        .memory(memory_bytes as usize)
-        .with_weighter(|_, v: &CachedEntry| v.size())
-        .storage()
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(BlockEngineConfig::new(
-            FsDeviceBuilder::new(dir)
-                .with_capacity(disk_bytes as usize)
-                .build()?,
-        ))
-        .build()
-        .await?;
-    Ok(Arc::new(FoyerHybridCache::new_with_cache(cache)))
+/// Build the memory-only foyer block cache SlateDB uses for parsed SST blocks
+/// when a disk part cache is installed. The disk tier of caching lives in the
+/// part cache (shared with blobs), so this cache stays entirely in memory,
+/// bounded by `memory_bytes`. `FoyerCache` installs the byte-size weighter
+/// internally, so the capacity actually bounds the cache.
+fn build_memory_cache(memory_bytes: u64) -> Arc<dyn DbCache> {
+    Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: memory_bytes,
+        ..FoyerCacheOptions::default()
+    }))
 }
 
 fn is_conflict(err: &slatedb::Error) -> bool {
@@ -1413,9 +1453,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_warm_cache_from_a_hybrid_block_cache() {
-        // given: a store on durable (file-backed) storage with a hybrid block
-        // cache whose disk tier is its own tempdir, holding written records.
+    async fn should_warm_cache_with_a_memory_block_cache_and_part_cache() {
+        // given: a store on durable (file-backed) storage configured with a
+        // memory block cache and a disk part cache in its own tempdir, holding
+        // written records.
         let storage_dir = tempfile::tempdir().expect("storage tempdir");
         let cache_dir = tempfile::tempdir().expect("cache tempdir");
         let url = format!("file://{}", storage_dir.path().display());
@@ -1426,7 +1467,7 @@ mod tests {
         };
         let store = Store::open_with_cache(&url, &cache)
             .await
-            .expect("open store with hybrid cache");
+            .expect("open store with part cache");
         let repo = store.create_repo("warm/me").await.expect("create").id;
         for byte in b'a'..=b'f' {
             store

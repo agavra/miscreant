@@ -6,6 +6,7 @@
 pub mod blobs;
 pub mod keys;
 pub mod objectdb;
+pub mod part_cache;
 pub mod slatedb_metrics;
 pub mod store;
 pub mod values;

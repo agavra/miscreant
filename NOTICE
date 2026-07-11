@@ -1,0 +1,13 @@
+miscreant
+Copyright (c) 2026 Almog Gavra
+
+This product includes software developed as part of the SlateDB project
+(https://github.com/slatedb/slatedb), licensed under the Apache License,
+Version 2.0.
+
+The module `src/storage/part_cache/` is vendored and adapted from SlateDB's
+`src/cached_object_store/` (and its `src/single_flight.rs` helper), upstream
+commit b140de0b. Adaptations are described in each file's header comment. A
+copy of the Apache License, Version 2.0, is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0

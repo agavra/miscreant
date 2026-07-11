@@ -49,14 +49,16 @@ pub struct Config {
     )]
     pub staging_root: PathBuf,
 
-    /// Directory for the disk tier of a hybrid (memory + disk) block cache.
-    /// Unset uses SlateDB's default in-memory block cache; set installs a
-    /// foyer hybrid cache whose disk tier lives here (created if missing).
+    /// Directory for the disk part cache (created if missing). Set it to cache
+    /// object parts on local disk: one cache, shared by SlateDB's SST reads and
+    /// offloaded-blob reads, under a single byte budget. Unset uses SlateDB's
+    /// default in-memory block cache and installs no part cache.
     #[arg(long, env = "MISCREANT_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Memory-tier capacity of the hybrid block cache, in bytes. Meaningful
-    /// only when `cache_dir` is set.
+    /// Capacity of the in-memory SlateDB block cache (parsed SST blocks), in
+    /// bytes. Meaningful only when `cache_dir` is set; SST byte caching lives
+    /// in the disk part cache.
     #[arg(
         long,
         env = "MISCREANT_CACHE_MEMORY_BYTES",
@@ -64,7 +66,7 @@ pub struct Config {
     )]
     pub cache_memory_bytes: u64,
 
-    /// Disk-tier capacity of the hybrid block cache, in bytes. Meaningful only
+    /// Byte budget for the whole disk part cache directory. Meaningful only
     /// when `cache_dir` is set.
     #[arg(
         long,

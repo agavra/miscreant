@@ -440,4 +440,141 @@ mod tests {
         assert_eq!(db.size(repo, &id).await.expect("size"), None);
         assert!(!db.exists(repo, &id).await.expect("exists"));
     }
+
+    /// An object store that counts data GET requests reaching the backend, used
+    /// to prove the part cache stops the offloaded-blob re-download problem.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if !options.head {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn should_stop_hitting_backend_after_first_offloaded_blob_read() {
+        // given: a counting backend wrapped by the disk part cache, feeding a
+        // BlobStore and ObjectDb (the offloaded-blob read path)
+        use crate::storage::part_cache::{
+            CachedObjectStore, CachedObjectStoreStats, FsCacheStorage,
+        };
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: backend,
+            gets: gets.clone(),
+        });
+        let stats = Arc::new(CachedObjectStoreStats::new());
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            cache_dir.path().to_path_buf(),
+            Some(64 * 1024 * 1024),
+            None,
+            stats.clone(),
+            128,
+        ));
+        let cached =
+            CachedObjectStore::new(counting, cache_storage, 4 * 1024 * 1024, false, stats).unwrap();
+        cached.start_evictor().await;
+        let backing: Arc<dyn ObjectStore> = cached;
+
+        let store = Store::open("memory://").await.expect("open store");
+        let repo = store.create_repo("blobs").await.expect("create").id;
+        let blobs = BlobStore::new(backing);
+        // Inline threshold 8 bytes: a 100 KiB blob is offloaded to the store.
+        let db = ObjectDb::new(store, blobs, 8, 6);
+        let id = oid(b'a');
+        let body = Bytes::from(vec![7u8; 100 * 1024]);
+        db.put(repo, &id, Kind::Blob, body.clone(), Durability::Durable)
+            .await
+            .expect("put");
+
+        // when: reading the offloaded blob repeatedly
+        let first = db.get(repo, &id).await.expect("get").expect("present");
+        let after_first = gets.load(std::sync::atomic::Ordering::SeqCst);
+        db.get(repo, &id).await.expect("get");
+        db.get(repo, &id).await.expect("get");
+        let after_more = gets.load(std::sync::atomic::Ordering::SeqCst);
+
+        // then: content round-trips and the backend GET count stops growing
+        assert_eq!(first, (Kind::Blob, body));
+        assert!(
+            after_first >= 1,
+            "the first read must fetch from the backend"
+        );
+        assert_eq!(
+            after_first, after_more,
+            "later reads must be served from the part cache"
+        );
+    }
 }

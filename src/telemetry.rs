@@ -173,6 +173,37 @@ pub fn describe() {
         Unit::Count,
         "lazy commit-graph backfills triggered while resolving a fetch or push"
     );
+
+    metrics::describe_counter!(
+        "part_cache_access_total",
+        Unit::Count,
+        "disk part-cache part accesses, by result (hit|miss)"
+    );
+    metrics::describe_counter!(
+        "part_cache_bytes_total",
+        Unit::Bytes,
+        "bytes served per disk part-cache part access, by result (hit|miss)"
+    );
+    metrics::describe_gauge!(
+        "part_cache_size_keys",
+        Unit::Count,
+        "files currently tracked in the disk part-cache directory"
+    );
+    metrics::describe_gauge!(
+        "part_cache_size_bytes",
+        Unit::Bytes,
+        "current on-disk size of the disk part cache"
+    );
+    metrics::describe_counter!(
+        "part_cache_evicted_keys_total",
+        Unit::Count,
+        "disk part-cache files evicted to stay under the byte budget"
+    );
+    metrics::describe_counter!(
+        "part_cache_evicted_bytes_total",
+        Unit::Bytes,
+        "disk part-cache bytes evicted to stay under the byte budget"
+    );
 }
 
 #[cfg(test)]

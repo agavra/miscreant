@@ -106,13 +106,14 @@ async fn main() -> anyhow::Result<()> {
 /// Bind the configured address and serve the git HTTP(S) protocol until
 /// shutdown.
 async fn serve(config: Config) -> anyhow::Result<()> {
-    // Warming at startup only pays off against a persistent (hybrid) cache; the
-    // default in-memory cache is empty every boot, so reject the combination
-    // rather than silently doing nothing useful.
+    // Warming at startup fills the disk part cache so the first request is
+    // served from disk; without a cache dir there is no part cache and the
+    // block cache is a transient in-memory one, so warming would do nothing
+    // useful. Reject the combination rather than silently no-op.
     if config.warm_on_start && config.cache_dir.is_none() {
         anyhow::bail!(
-            "--warm-on-start requires --cache-dir: there is no persistent block \
-             cache to warm otherwise"
+            "--warm-on-start requires --cache-dir: there is no disk part cache \
+             to warm otherwise"
         );
     }
 

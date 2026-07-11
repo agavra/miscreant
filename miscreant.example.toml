@@ -21,21 +21,23 @@ auto_create_repos = true
 # typical Linux host.
 staging_root = "/tmp/miscreant-staging"
 
-# Directory for the disk tier of a hybrid (memory + disk) block cache. Left
-# unset (the built-in default), SlateDB uses its in-memory block cache. Set it
-# to install a foyer hybrid cache whose disk tier lives at this path.
+# Directory for the disk part cache. Left unset (the built-in default), SlateDB
+# uses its in-memory block cache and no part cache is installed. Set it to cache
+# object parts on local disk: one cache, shared by SlateDB's SST reads and
+# offloaded-blob reads, under a single byte budget.
 # cache_dir = "/var/cache/miscreant"
 
-# Memory-tier capacity of the hybrid block cache, in bytes (512 MiB). Only
-# meaningful when cache_dir is set.
+# Capacity of the in-memory SlateDB block cache (parsed SST blocks), in bytes
+# (512 MiB). Only meaningful when cache_dir is set; SST byte caching lives in
+# the disk part cache.
 cache_memory_bytes = 536870912
 
-# Disk-tier capacity of the hybrid block cache, in bytes (32 GiB). Only
-# meaningful when cache_dir is set.
+# Byte budget for the whole disk part cache directory (32 GiB). Only meaningful
+# when cache_dir is set.
 cache_disk_bytes = 34359738368
 
-# Warm the block cache from the manifest at startup, before the listener binds,
-# so the first request is served hot. Requires cache_dir.
+# Warm the disk part cache from the manifest at startup, before the listener
+# binds, so the first request is served hot. Requires cache_dir.
 warm_on_start = false
 
 # zlib level (0-9) at which object content is deflated when written. Higher

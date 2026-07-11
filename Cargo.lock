@@ -2149,8 +2149,10 @@ name = "miscreant"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
+ "chrono",
  "clap",
  "flate2",
  "foyer",
@@ -2160,10 +2162,16 @@ dependencies = [
  "gix-object",
  "gix-pack",
  "gix-packetline-blocking",
+ "log",
+ "lru",
  "metrics",
  "metrics-exporter-prometheus",
+ "object_store",
+ "parking_lot",
+ "rand 0.9.4",
  "reqwest",
  "serde",
+ "serde_json",
  "slatedb",
  "slatedb-common",
  "tempfile",
@@ -2174,6 +2182,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "walkdir",
  "zlib-rs",
 ]
 
