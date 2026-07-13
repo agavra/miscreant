@@ -393,11 +393,11 @@ async fn should_clone_an_empty_repository_like_the_reference_server() {
     }
 }
 
-// miscreant advertises the `filter` argument only on the v2 `fetch` command;
-// its classic (v0) upload-pack has no filter capability and always sends every
-// object, so partial clones are exercised under v2 only. Over v0 miscreant
-// would ignore the filter and diverge from the reference server, which honours
-// it under both protocols.
+// miscreant advertises the `filter` argument only on the v2 `fetch` command,
+// so partial clones are exercised under v2 only. Over the classic protocol a
+// real client sees no advertised filter capability and silently drops the
+// filter, cloning in full — which would diverge from the reference server,
+// which honours `--filter` under both protocols.
 #[tokio::test(flavor = "multi_thread")]
 async fn should_partially_clone_with_blob_none_and_fault_in_like_the_reference_server() {
     // given: history whose tip rewrites a file, leaving one historical blob

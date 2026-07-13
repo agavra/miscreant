@@ -216,6 +216,37 @@ async fn should_reject_a_want_ref_fetch_argument_cleanly() {
 }
 
 #[tokio::test]
+async fn should_reject_a_classic_fetch_carrying_a_filter() {
+    // given
+    let server = TestServer::spawn(test_config()).await;
+    server.store().create_repo("proj").await.expect("create");
+    let bogus = "f".repeat(40);
+
+    // when: a classic (v0) fetch carrying a partial-clone filter line — no
+    // Git-Protocol header, so it reaches the classic handler, which advertises
+    // no filter capability
+    let mut body = pkt(format!("want {bogus}\n").as_bytes());
+    body.extend(pkt(b"filter blob:none\n"));
+    body.extend_from_slice(FLUSH);
+    body.extend(pkt(b"done\n"));
+    let response = reqwest::Client::new()
+        .post(format!("{}/proj/git-upload-pack", server.base_url()))
+        .body(body)
+        .send()
+        .await
+        .expect("send request");
+
+    // then: a clear in-band ERR pointing at the protocol version, not a served
+    // (unfiltered) pack
+    let text =
+        String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf-8 body");
+    assert!(
+        text.contains("ERR") && text.contains("filter requires protocol v2"),
+        "body: {text}"
+    );
+}
+
+#[tokio::test]
 async fn should_return_err_for_an_unimplemented_v2_command() {
     // given
     let server = TestServer::spawn(test_config()).await;

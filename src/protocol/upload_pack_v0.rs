@@ -111,7 +111,8 @@ async fn build_advertisement(state: &AppState, meta: &RepoMeta) -> Result<Vec<u8
 pub async fn upload_pack(state: &AppState, repo: &str, body: Bytes) -> Response {
     let request = match parse_request(&body) {
         Ok(request) => request,
-        Err(ParseError) => {
+        Err(ParseError::Filter) => return upload_pack::reject_fetch("filter requires protocol v2"),
+        Err(ParseError::Malformed) => {
             tracing::debug!("malformed upload-pack request");
             return malformed();
         }
@@ -319,9 +320,15 @@ struct Request {
     multi_ack_detailed: bool,
 }
 
-/// The request body was not framed as a valid classic fetch request.
+/// Why a classic fetch request could not be parsed.
 #[derive(Debug)]
-struct ParseError;
+enum ParseError {
+    /// The body was not framed as a valid classic fetch request.
+    Malformed,
+    /// The client sent a `filter` line: partial-clone filtering is a
+    /// protocol-v2 feature the classic protocol does not carry.
+    Filter,
+}
 
 /// Parse a classic fetch request: `want <oid>` lines (the first carrying the
 /// client's space-separated capabilities after the oid), then `have <oid>`
@@ -342,7 +349,7 @@ fn parse_request(body: &Bytes) -> Result<Request, ParseError> {
                 bytes_consumed,
             }) => (line, bytes_consumed),
             // A truncated final packet or a bad length prefix is malformed.
-            _ => return Err(ParseError),
+            _ => return Err(ParseError::Malformed),
         };
         offset += consumed;
         saw_line = true;
@@ -352,7 +359,7 @@ fn parse_request(body: &Bytes) -> Result<Request, ParseError> {
             PacketLineRef::Flush => {}
             PacketLineRef::Data(data) => {
                 let text = std::str::from_utf8(data.strip_suffix(b"\n").unwrap_or(data))
-                    .map_err(|_| ParseError)?;
+                    .map_err(|_| ParseError::Malformed)?;
                 if text == "done" {
                     request.done = true;
                     break;
@@ -363,7 +370,8 @@ fn parse_request(body: &Bytes) -> Result<Request, ParseError> {
                         Some((hex, caps)) => (hex, Some(caps)),
                         None => (rest, None),
                     };
-                    let oid = ObjectId::from_hex(hex.as_bytes()).map_err(|_| ParseError)?;
+                    let oid =
+                        ObjectId::from_hex(hex.as_bytes()).map_err(|_| ParseError::Malformed)?;
                     request.wants.push(oid);
                     if first_want {
                         if let Some(caps) = caps {
@@ -372,22 +380,29 @@ fn parse_request(body: &Bytes) -> Result<Request, ParseError> {
                         first_want = false;
                     }
                 } else if let Some(hex) = text.strip_prefix("have ") {
-                    let oid = ObjectId::from_hex(hex.as_bytes()).map_err(|_| ParseError)?;
+                    let oid =
+                        ObjectId::from_hex(hex.as_bytes()).map_err(|_| ParseError::Malformed)?;
                     request.haves.push(oid);
+                } else if text.strip_prefix("filter ").is_some() {
+                    // Partial-clone filtering is a protocol-v2 feature; the
+                    // classic protocol advertises no `filter` capability, so a
+                    // client that sends one anyway is refused explicitly rather
+                    // than silently served an unfiltered pack.
+                    return Err(ParseError::Filter);
                 } else {
-                    // The server advertises no capability (shallow, filter, …)
-                    // that would license any other line, so anything else is
+                    // The server advertises no other capability (shallow, …)
+                    // that would license any further line, so anything else is
                     // malformed.
-                    return Err(ParseError);
+                    return Err(ParseError::Malformed);
                 }
             }
             // A delimiter or response-end packet has no place in a fetch request.
-            _ => return Err(ParseError),
+            _ => return Err(ParseError::Malformed),
         }
     }
 
     if !saw_line {
-        return Err(ParseError);
+        return Err(ParseError::Malformed);
     }
     Ok(request)
 }
@@ -485,6 +500,21 @@ mod tests {
         // then
         assert_eq!(request.haves, vec![oid(b'c')]);
         assert!(request.done);
+    }
+
+    #[test]
+    fn should_refuse_a_filter_line_as_a_protocol_v2_feature() {
+        // given: a classic fetch body carrying a partial-clone filter line
+        let mut body = pkt(format!("want {}\n", oid(b'a')).as_bytes());
+        body.extend(pkt(b"filter blob:none\n"));
+        body.extend_from_slice(b"0000");
+        body.extend(pkt(b"done\n"));
+
+        // when
+        let err = parse_request(&Bytes::from(body)).expect_err("filter is refused");
+
+        // then: the filter-specific refusal, not a generic malformed body
+        assert!(matches!(err, ParseError::Filter));
     }
 
     #[test]
